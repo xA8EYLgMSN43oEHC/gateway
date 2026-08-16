@@ -1,0 +1,5 @@
+# temp working files (tests, screenshots-in-progress, extracted JS)
+_tmp/
+
+# v1 backup of the game (git history supersedes it)
+apshai (copy).html
