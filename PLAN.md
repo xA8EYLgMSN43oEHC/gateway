@@ -57,9 +57,18 @@ algorithm is given precisely enough to reproduce behavior.
 - Boss music auto-starts when a boss spawns and reverts to the dungeon theme when the boss dies or the dungeon advances.
 - **Spell-menu hardening:** spell-index clamped after a cast shrinks the list (no stale-index crash), submenu auto-closes when the inventory empties (no NaN from modulo-by-zero), and spell pickup messages now say `… found! (M to cast)` so it's clear spells are inventory items that must be cast, not instant effects.
 
+**Done in v1.7** (boss rewards + victory):
+- **Boss rewards** — killing a boss scores `50 × level` (big yellow number) and drops a **jeweled treasure** (1000, untrapped) plus one **high-value item** (`bossLoot()`: top-tier weapon/armor/shield if not already owned, wand, or any spell — pool can never be empty). Drops land at the boss's death position.
+- **Victory state** — the `EXIT` tile of the final dungeon (L8 D16) now triggers `winGame()` instead of looping back to L8 D1: `state='victory'`, `SFX.win()` fanfare, music stops, and a "YOU ESCAPED!" screen shows the final Gold score (Enter/Space → title).
+- **Title dungeon select fixed** — the title screen's dungeon picker was decorative (startGame always began L1 D1); `startGame` now honors `titleDungeon+1`.
+- **`?level=N&dungeon=M`** — testing shortcut to start directly in any dungeon (e.g. `?level=8&dungeon=16` → final boss).
+- **Traps actually trigger now** — `trapType[]` (Uint8Array) was being assigned string names, which coerced to 0: `triggerTrap(0)` → `TRAPS[0]` → undefined → every trap silently did nothing. Now stores the type index. Also: trap damage has a `minDmg=1` floor (armor/luck can't make a trap a no-op), pit dmg `[2,5]`, freeze 5s→2s (was an auto-kill).
+- **Trap visibility decoupled from fog-of-war** — traps had a separate `trapSeen[]` state: they no longer glow red when you merely walk near them (fog-of-war `revealAround` was marking their tiles explored). Now revealed only by Locate Traps, the Map spell, or triggering.
+- **"Black box" items fixed** — `ITEM_POOLS` had three dead types (`helm`, `magicshield`, `magicarmor`) with no pickup/draw handling: they rendered as a bare dark plate and vanished on pickup giving nothing (L7–8 were hit hardest). Replaced with real items (`cross`/`large`/`plate`), `mkItem` now uses the cumulative 1..lv pool (fixes 9× duplicate Plate at L7), and `drawItem` has a grey-gem fallback for unknown types.
+
 **Top roadmap items** (details in §21.2): high-score persistence (`localStorage`), touch controls, and the remaining balance/look polish (see §21.2).
 
-> **Status:** v1.6 is complete and playable (see §19 for how it was verified). The items above are the planned next steps.
+> **Status:** v1.7 is complete and playable (see §19 for how it was verified). The items above are the planned next steps.
 
 ---
 
@@ -310,7 +319,7 @@ level, dungeon, score, timeLeft, titleDungeon=0
 state='title', flash=0, flashT=0, msgQ=[], panel=null,
 menu=false, menuIdx=0, paused=false, tGlobal=0, minimap=true
 ```
-- `state` ∈ { `'title'`, `'play'`, `'over'` }.
+- `state` ∈ { `'title'`, `'play'`, `'over'`, `'victory'` } (victory added in v1.7).
 - `paused` (boolean) — toggled by Esc during play.
 - `panel` — when non-null, a status/info panel is shown (game logic frozen).
 - `menu` (boolean) — the action menu overlay (game logic frozen).
@@ -324,7 +333,9 @@ menu=false, menuIdx=0, paused=false, tGlobal=0, minimap=true
 ### 6.2 Transitions
 - `title` → `play`: Enter/Space (starts at chosen dungeon, level 1).
 - `play` → `over`: lives reach 0.
+- `play` → `victory`: stepping on the `EXIT` tile of the final dungeon (L8 D16) (v1.7).
 - `over` → `title`: Enter/Space.
+- `victory` → `title`: Enter/Space.
 - `play` ↔ paused: Esc.
 - `play` with `panel`/`menu`: logic frozen, overlay shown; dismiss with
   M/Enter/Space/Esc.
@@ -391,29 +402,39 @@ menu=false, menuIdx=0, paused=false, tGlobal=0, minimap=true
 1..end (never room 0).
 
 ### 7.3 `mkItem(x, y, rng, lv)` — item roll
+Picks one type from the **cumulative** `ITEM_POOLS[1..lv]` (v1.7 — was
+single-level only, which made L7 spawn 9 identical Plate Armors). `arrows`/
+`magicarrows` get `n = 5 + floor(rng()*4)` (5–8).
+
 ```
-roll = rng()
-<0.50  treasure:  mi = min(5, floor(rng()*3 + lv*0.6)); mat=MATS[mi]
-                    → {type:'treasure', mat:mat.name, value:mat.v,
-                       kind:TREAS[floor(rng()*len)], col:mat.col}
-<0.62  potion
-<0.70  arrows:    n = 6 + floor(rng()*8)   (6–13)
-<0.76  key
-<0.82  shortsword
-<0.87  longsword
-<0.90  bow
-<0.94  strength
-<0.97  agility
-else   luck
+ITEM_POOLS = {
+  1:['bow','arrows','shortsword','potion','stun'],
+  2:['small','chain','potion','confuse','map'],
+  3:['longsword','large','luck','agility'],
+  4:['magicarrows','cross'],
+  5:['twohand','breast','strength','cross'],
+  6:['large','wand','protect','teleport'],
+  7:['plate'],
+  8:['plate','blast']
+}
 ```
-Higher levels bias treasure toward more valuable materials (`lv*0.6` term).
+
+v1.7: removed three **dead types** left over from the v1.4 design (`helm` L4,
+`magicshield` L6, `magicarmor` L7/8) — they had no `pickup` case and no
+`drawItem` branch, so they rendered as a bare backing plate (a "black box")
+and vanished on pickup giving nothing. Replaced with `cross` (L4), `large`
+(L6), `plate` (L7/8). As a guard, `drawItem` now has a fallback branch (grey
+gen) for any unknown type so a future pool typo can't be invisible.
 
 ### 7.4 `newLevel(lv, dn)` / `startGame()`
 - `newLevel`: set `level,dungeon`; `genDungeon`; reset `timeLeft=390`,
   `projectiles=[]`, `msgQ=[]`, `dmgNums=[]`, `panel=null`, `menu=false`,
   `menuIdx=0`.
-- `startGame`: `score=0`; `window.__carry=null`; `p=newPlayer()`; `newLevel(1,1)`;
-  `state='play'`.
+- `startGame(lv, dn)`: `score=0`; `window.__carry=null`; `p=newPlayer()`;
+  `newLevel(lv, dn)`; `state='play'`. Both args optional and clamped to
+  1..8 / 1..16; the dungeon defaults to **`titleDungeon+1`** so the title
+  screen's dungeon selection actually works (v1.7 fix — it was previously
+  ignored). Music starts as `boss` when `dn===16`, else `dungeon`.
 
 ---
 
@@ -467,8 +488,10 @@ facing down:  dy> 4 && |dx|<15
 - **Damage:** `dmg = monster.wp - ARMORS[p.armor].ap - (shield?SHIELDS[shield].sp:0)`;
   if a second `1..31` roll `< luck`, subtract `level` (lucky bonus).
   `damagePlayer(max(0, dmg))`.
-- Traps use the same damage path via `monsterAttackDmg(baseDmg)` (no hit-chance
-  roll — traps always apply damage).
+- Traps use the same damage path via `monsterAttackDmg(baseDmg, minDmg)` (no
+  hit-chance roll — traps always apply damage). **v1.7:** traps pass
+  `minDmg=1` so armor + luck can never reduce a trap to a no-op; monster
+  attacks use the default `minDmg=0` (fully mitigatable, unchanged).
 
 ### 8.4 Taking damage (`damagePlayer(n)`)
 - If `invuln>0`, ignore (i-frames).
@@ -553,8 +576,30 @@ facing them with a key (§8.1). Rendered as a brown plank with a yellow knob.
 Level-gated traps (pit/stone/freeze/death), `level+2` per dungeon (max 16), each
 assigned a type from `TRAPS` of level ≤ current. Triggered once when stepped on
 (§8.1) **unless `p.protectT>0`** (Protect spell). Damage traps use the
-monster-attack formula (§8.3); freeze sets `p.freezeT`; death is instant.
+monster-attack formula (§8.3) with a `minDmg=1` floor; freeze sets
+`p.freezeT`; death costs a life (respawns at room start with full HP,
+or ends the game on the last life — same as monster death).
 **Locate Traps** (menu) reveals all traps in the dungeon at once.
+
+**Balance (v1.7):** pit `dmg [2,5]` (was `[1,3]` — could be fully negated by
+default leather armor); freeze `2s` (was `5s` — with no move/attack allowed
+that was an auto-kill, worse than the L8 death trap).
+
+**Trigger bug fixed (v1.7):** `trapType[]` is a `Uint8Array` but the generator
+assigned the *string* name (`'pit'`, …) to it — a string coerces to `NaN` →
+`0`, so `triggerTrap(0)` → `TRAPS[0]` → `undefined` → **every trap in the
+game silently did nothing** (no damage, no freeze, no message, no sound).
+Now the generator stores the `TRAP_TYPES` **index** and `triggerTrap` looks
+up `TRAPS[TRAP_TYPES[idx]]`.
+
+**Visibility (v1.7 fix):** traps have their own `trapSeen[]` array, separate
+from the fog-of-war `revealed[]`. A trap is drawn (red square in the main
+view, red dot on the minimap) only when `trapSeen` is set — by **Locate
+Traps** or by triggering the trap. (The **Map** spell clears fog-of-war but
+deliberately does *not* reveal traps — it shows layout, not hazards.) Before
+v1.7 both used `revealed[]`, so `revealAround()` (fog-of-war, 3-tile radius,
+every frame) marked nearby trap tiles as explored and traps glowed red as the
+player approached them.
 
 ### 11.4 Secrets
 `SECRET` tiles look like normal floor. **Search Secret** (menu) scans a 7×7
@@ -591,6 +636,15 @@ golden-crowned sprite. While a boss is alive, `renderHUD` draws a boss health ba
 (name + red bar) in the bottom-left. `monsterAttack` uses the monster's own
 `wp`/`armor` so bosses hit harder than regular monsters.
 
+**Boss rewards (v1.7):** killing a boss scores `50 × level` (shown as a big
+yellow floating number) and drops **two items at its death position**:
+1. A **jeweled treasure** (value 1000, never trapped — it's a reward, not a
+   trap) with a random kind.
+2. One **high-value item** from `bossLoot()`: 2-Hand/Long Sword (only if not
+   already owned), Plate Armor / Large Shield (only if not already worn), a
+   Wand, or any of the 6 spells. Wand + spells always stack, so the pool can
+   never be empty even for a fully geared player.
+
 ---
 
 ## 12. Progression & Timer
@@ -609,8 +663,13 @@ golden-crowned sprite. While a boss is alive, `renderHUD` draws a boss health ba
   `On to the next dungeon...`.
 - **Ways to advance:** reach the `EXIT` tile, the timer runs out, or the
   **Next Level** menu action.
+- **Victory (v1.7):** reaching the `EXIT` tile of the **final dungeon (L8
+  D16)** does not advance — it calls `winGame()`: `state='victory'`, the
+  `SFX.win()` fanfare plays, music stops. `renderVictory()` shows a
+  "YOU ESCAPED!" screen with the final Gold score; Enter/Space returns to the
+  title. All other exits advance normally.
 - **Score** carries across dungeons; it is the "Gold" shown in the HUD and on
-  the game-over screen.
+  the game-over and victory screens.
 
 ---
 
@@ -771,7 +830,8 @@ A live overview of the dungeon, drawn in the **bottom-right** corner
   (reveals the entire dungeon).
 - **Tile colors** (1 px each, revealed only): wall `[74,74,92]`,
   floor/secret `[30,30,42]`, door `[150,100,50]`, exit `[0,220,220]`,
-  trap = red `[220,40,40]`.
+  trap = red `[220,40,40]` **only when `trapSeen[]`** (v1.7 — unlocated traps
+  render as plain floor, same as the main view).
 - **Entities** (drawn over the map, scaled by `s`, revealed tiles only):
   monsters = 2×2 red; items = 1×1 yellow; player = 3×3 white with a 1px
   black outline (always shown).
@@ -821,6 +881,9 @@ An IIFE at the end of the script reads `location.search`:
 - **`?hit=1`** — combat preview: `startGame()`, give the player a short sword,
   then every 120ms keep a goblin 14px in front of the hero (facing right) and
   press Space. Produces a continuous stream of damage numbers for screenshots.
+- **`?level=N&dungeon=M`** (v1.7) — start directly in that dungeon, e.g.
+  `apshai.html?level=8&dungeon=16` jumps straight to the final Dragon boss.
+  Values are clamped to 1..8 / 1..16 by `startGame`.
 - No query param → normal game (title screen).
 
 These are harmless and only activate with the query string.
@@ -920,6 +983,8 @@ the bow, and every pickup icon without being shown a legend.
 - *(Done in v1.5: boss per level's final dungeon.)*
 - *(Done in v1.6: audio — see §22.)*
 - *(Done in v1.5: walk-bob animation on hero and monsters.)*
+- *(Done in v1.7: boss rewards — 50×level score + jeweled treasure + high-value loot drop.)*
+- *(Done in v1.7: victory state — L8 D16 exit → "YOU ESCAPED!" screen instead of looping.)*
 - **Persistence:** high score via `localStorage`.
 - **Touch controls** for mobile.
 - **Remaining balance/look polish:** deeper difficulty tuning across all 8
@@ -943,7 +1008,7 @@ original game.
   through it. Mute (**Z**) sets the master gain to 0/0.15 and flips `muted`
   (SFX and music scheduling also check `muted` to avoid wasted nodes).
 
-### 22.2 SFX (`SFX` object — 15 one-shots)
+### 22.2 SFX (`SFX` object — 16 one-shots)
 Each is a few lines of oscillator/noise + gain envelope (fast attack,
 exponential decay to 0.001 → no clicks):
 
@@ -964,11 +1029,13 @@ exponential decay to 0.001 → no clicks):
 | `move` | square 440 Hz, 30 ms (menu cursor) |
 | `levelup` | C5–E5–G5–C6 arpeggio, 90 ms apart |
 | `boss` | sawtooth A2–A2–C3–E3 fanfare, 120 ms apart |
+| `win` (v1.7) | square C5–E5–G5–C6–G5–C6–E6–G6 rising fanfare, 110 ms apart |
 
-Hook points: swing/shoot/hit in `tryAttack`; kill in `killMonster`; hurt/die in
-`damagePlayer`; treasure/pickup in `pickup`; door in `updatePlayer`; trap in
-`triggerTrap`; spell in `castSpell`; levelup in `advanceLevel`; boss in
-`placeEntities`; select/move throughout `onKey` (menu + title navigation).
+Hook points: swing/shoot/hit in `tryAttack`; kill/die in `killMonster` (die
+also on boss kill); hurt/die in `damagePlayer`; treasure/pickup in `pickup`;
+door in `updatePlayer`; trap in `triggerTrap`; spell in `castSpell`;
+levelup in `advanceLevel`; boss in `placeEntities`; **win in `winGame()`**
+(v1.7); select/move throughout `onKey` (menu + title navigation).
 
 ### 22.3 Music (step sequencer)
 - **Patterns:** `MUSIC.dungeon` and `MUSIC.boss` — each an 8-bar loop of 64

@@ -100,6 +100,7 @@ const SFX={
   select(){ beep(880,0.04,'square',0.3); },
   move(){ beep(440,0.03,'square',0.2); },
   levelup(){ [523,659,784,1047].forEach((f,i)=>beep(f,0.12,'square',0.5,0,i*0.09)); },
+  win(){ [523,659,784,1047,784,1047,1319,1568].forEach((f,i)=>beep(f,0.15,'square',0.45,0,i*0.11)); },
   boss(){ [200,200,262,330].forEach((f,i)=>beep(f,0.15,'sawtooth',0.5,0,i*0.12)); }
 };
 // --- music: 8-bar (64 eighth-note steps) loops, square lead + triangle bass (SID style)
@@ -338,7 +339,7 @@ function mulberry32(a){
 }
 
 /* ---- dungeon generation ------------------------------------------------ */
-let map, rooms, trapDone, revealed, trapType;
+let map, rooms, trapDone, revealed, trapType, trapSeen;
 function genDungeon(level, dungeon){
   const rng = mulberry32(level*7919 + dungeon*104729 + 12345);
   map = new Uint8Array(MAP_W*MAP_H).fill(T.WALL);
@@ -371,6 +372,7 @@ function genDungeon(level, dungeon){
   trapDone = new Uint8Array(MAP_W*MAP_H);
   revealed = new Uint8Array(MAP_W*MAP_H);
   trapType = new Uint8Array(MAP_W*MAP_H);
+  trapSeen = new Uint8Array(MAP_W*MAP_H);   // trap visibility (separate from fog-of-war)
   placeEntities(level, dungeon, rng);
 }
 
@@ -419,9 +421,9 @@ const MONSTERS = {
 const MONSTER_TYPES = Object.keys(MONSTERS).filter(t=>t!=='boss');
 // Trap types by level (damage like a monster attack, or freeze). Max 16 per dungeon.
 const TRAPS = {
-  pit:    {name:'Pit Trap',     lv:1, dmg:[1,3]},
+  pit:    {name:'Pit Trap',     lv:1, dmg:[2,5]},   // never 0 after leather ap1
   stone:  {name:'Stone Trap',   lv:2, dmg:[2,8]},
-  freeze: {name:'Freeze Trap',  lv:4, freeze:5},
+  freeze: {name:'Freeze Trap',  lv:4, freeze:2},    // seconds (5 was an auto-kill)
   death:  {name:'Death Trap',   lv:8, death:true}
 };
 const TRAP_TYPES = Object.keys(TRAPS);
@@ -451,11 +453,11 @@ const ITEM_POOLS = {
   1:['bow','arrows','shortsword','potion','stun'],
   2:['small','chain','potion','confuse','map'],
   3:['longsword','large','luck','agility'],
-  4:['magicarrows','helm'],
+  4:['magicarrows','cross'],
   5:['twohand','breast','strength','cross'],
-  6:['magicshield','wand','protect','teleport'],
-  7:['magicarmor'],
-  8:['magicarmor','blast']
+  6:['large','wand','protect','teleport'],
+  7:['plate'],
+  8:['plate','blast']
 };
 const MATS = [
   {name:'Lead', v:0, col:C.gray},
@@ -508,8 +510,11 @@ function pickMonsterTypes(lv, rng){
   return out;
 }
 function mkItem(x,y,rng,lv){
-  // distribution inspired by the original: guaranteed arrows + level items + random
-  const pool=ITEM_POOLS[lv]||ITEM_POOLS[1];
+  // distribution inspired by the original: guaranteed arrows + level items + random.
+  // Pool is cumulative (levels 1..lv) so high levels get variety, not 9 copies
+  // of the same top-tier item.
+  const pool=[];
+  for(let l=1;l<=lv;l++) for(const t of (ITEM_POOLS[l]||[])) pool.push(t);
   const type=pool[(rng()*pool.length)|0];
   const base={type,x,y};
   if(type==='arrows') base.n=5+((rng()*4)|0);        // +[5;8]
@@ -634,8 +639,10 @@ function placeEntities(level, dungeon, rng){
     const tx=idx%MAP_W, ty=(idx/MAP_W)|0;
     if(map[idx]===T.FLOOR && !(tx===s.cx&&ty===s.cy)){ map[idx]=T.TRAP; traps++; }
   }
-  // assign a trap type to each trap tile
-  for(let i=0;i<MAP_W*MAP_H;i++) if(map[i]===T.TRAP) trapType[i]=trapPool[(rng()*trapPool.length)|0];
+  // assign a trap type to each trap tile (store the TRAP_TYPES index —
+  // trapType is a Uint8Array, so a string assignment would silently become 0
+  // and the trap would trigger nothing)
+  for(let i=0;i<MAP_W*MAP_H;i++) if(map[i]===T.TRAP) trapType[i]=TRAP_TYPES.indexOf(trapPool[(rng()*trapPool.length)|0]);
   let secs=0;
   for(let i=0;i<MAP_W*MAP_H && secs<6;i++){
     const idx=Math.floor(rng()*MAP_W*MAP_H);
@@ -670,11 +677,13 @@ function newLevel(lv,dn){
   genDungeon(lv,dn);
   timeLeft=390; projectiles=[]; msgQ=[]; dmgNums=[]; panel=null; menu=false; menuIdx=0; minimap=true;
 }
-function startGame(){
+function startGame(lv, dn){
+  lv=Math.min(8,Math.max(1,lv||1));
+  dn=Math.min(16,Math.max(1,dn||(titleDungeon+1)));   // title-screen dungeon select
   score=0; window.__carry=null; p=newPlayer();
-  newLevel(1,1);
+  newLevel(lv,dn);
   state='play'; paused=false;
-  startMusic('dungeon');
+  startMusic(dn===16?'boss':'dungeon');
 }
 
 /* ---- input ------------------------------------------------------------- */
@@ -713,6 +722,7 @@ function onKey(code){
     return;
   }
   if(state==='over'){ if(code==='Enter'||code==='Space'){ SFX.select(); state='title'; } return; }
+  if(state==='victory'){ if(code==='Enter'||code==='Space'){ SFX.select(); state='title'; } return; }
   if(panel){ if(code==='KeyM'||code==='Enter'||code==='Space'||code==='Escape'){ panel=null; SFX.select(); } return; }
   // menu handling (before Escape/pause so Esc closes menus, not pauses)
   if(menu){
@@ -786,7 +796,7 @@ function dropItem(){
 function locateTraps(){
   let n=0;
   for(let ty=0;ty<MAP_H;ty++)for(let tx=0;tx<MAP_W;tx++)
-    if(map[ty*MAP_W+tx]===T.TRAP){ revealed[ty*MAP_W+tx]=1; n++; }
+    if(map[ty*MAP_W+tx]===T.TRAP){ trapSeen[ty*MAP_W+tx]=1; revealed[ty*MAP_W+tx]=1; n++; }
   msg(n?('Found '+n+' trap'+(n>1?'s':'')):'No traps here');
 }
 function searchSecret(){
@@ -850,6 +860,10 @@ function showStatus(){
   ]};
   menu=false;
 }
+function winGame(){
+  state='victory';
+  SFX.win(); stopMusic();
+}
 function advanceLevel(how){
   let dn=dungeon+1, lv=level;
   if(dn>16){ dn=1; lv++; if(lv>8) lv=8; }
@@ -904,9 +918,31 @@ function tryAttack(){
   if(hit){ flash=1; flashT=0.18; }
 }
 function killMonster(m){
-  const i=monsters.indexOf(m); if(i>=0) monsters.splice(i,1); score+=5;
-  if(m.boss){ SFX.die(); startMusic('dungeon'); }
-  else SFX.kill();
+  const i=monsters.indexOf(m); if(i>=0) monsters.splice(i,1);
+  if(m.boss){
+    const pts=50*level; score+=pts;
+    addDmgNum(m.x, m.y-12, pts, C.yellow, 2);   // big score number
+    const jm=MATS[5];                            // guaranteed jeweled treasure drop
+    items.push({type:'treasure',x:m.x,y:m.y,mat:jm.name,value:jm.v,kind:TREAS[(Math.random()*TREAS.length)|0],col:jm.col,trapped:false});
+    items.push(bossLoot(m.x,m.y));               // + one high-value item
+    msg('Boss slain! +'+pts+' gold');
+    SFX.die(); startMusic('dungeon');
+  } else {
+    score+=5; SFX.kill();
+  }
+}
+// Boss loot: one high-value item the player doesn't already have — top-tier
+// weapon/armor/shield, a wand, or any spell. Wand + spells always stack, so
+// the pool can never be empty.
+function bossLoot(x,y){
+  const pool=[
+    ...(['twohand','longsword'].filter(w=>!p.weapons.includes(w))),
+    ...(p.armor!=='plate'?['plate']:[]),
+    ...(p.shield!=='large'?['large']:[]),
+    'wand',
+    ...SPELL_TYPES
+  ];
+  return {type:pool[(Math.random()*pool.length)|0], x, y};
 }
 // monster attack: hit chance = (1..31) > agility; damage = wp - armor - shield
 // (- level if a 1..31 roll < luck). Gauntlet/helm don't reduce damage (simplified).
@@ -930,21 +966,22 @@ function damagePlayer(n){
 }
 
 /* ---- per-frame update -------------------------------------------------- */
-function triggerTrap(type){
-  const t=TRAPS[type];
+function triggerTrap(typeIdx){
+  const t=TRAPS[TRAP_TYPES[typeIdx]];
   if(!t) return;
   SFX.trap();
   if(t.death){ damagePlayer(999); msg('Death trap!'); return; }
   if(t.freeze){ p.freezeT=t.freeze; msg('Frozen!'); return; }
   const dmg=t.dmg[0]+Math.floor(Math.random()*(t.dmg[1]-t.dmg[0]+1));
-  monsterAttackDmg(dmg);                              // like a monster attack (armor/shield/luck apply)
+  monsterAttackDmg(dmg,1);                            // like a monster attack (armor/shield/luck apply), always >=1
   msg(t.name+'!');
 }
 // trap damage path: applies armor/shield/luck like a monster hit (no hit-chance roll)
-function monsterAttackDmg(baseDmg){
+function monsterAttackDmg(baseDmg,minDmg=0){
   let dmg=baseDmg - ARMORS[p.armor].ap - (p.shield?SHIELDS[p.shield].sp:0);
   if(1+Math.floor(Math.random()*31) < p.luck) dmg-=level;
-  damagePlayer(Math.max(0,dmg));
+  // minDmg: traps pass 1 so armor/luck can never make a trap a no-op
+  damagePlayer(Math.max(minDmg,dmg));
 }
 // Reveal tiles within a radius of the player (fog of war)
 function revealAround(cx,cy,r){
@@ -977,8 +1014,8 @@ function updatePlayer(dt){
   const tx=Math.floor(p.x/TILE), ty=Math.floor(p.y/TILE);
   revealAround(tx,ty,3);   // fog of war: reveal 3-tile radius
   const t=tileAt(tx,ty);
-  if(t===T.TRAP && !trapDone[ty*MAP_W+tx] && p.protectT<=0){ trapDone[ty*MAP_W+tx]=1; revealed[ty*MAP_W+tx]=1; triggerTrap(trapType[ty*MAP_W+tx]); }
-  if(t===T.EXIT){ advanceLevel('exit'); return; }
+  if(t===T.TRAP && !trapDone[ty*MAP_W+tx] && p.protectT<=0){ trapDone[ty*MAP_W+tx]=1; trapSeen[ty*MAP_W+tx]=1; revealed[ty*MAP_W+tx]=1; triggerTrap(trapType[ty*MAP_W+tx]); }
+  if(t===T.EXIT){ if(level===8&&dungeon===16) winGame(); else advanceLevel('exit'); return; }
 
   const fx=tx+dirX(p.facing), fy=ty+dirY(p.facing);
   if(tileAt(fx,fy)===T.DOOR){
@@ -1112,7 +1149,9 @@ function drawTile(tx,ty,sx,sy){
     ctx.fillStyle=rgb(C.yellow); ctx.fillRect(sx+7,sy+6,2,2);                    // keyhole
     ctx.fillStyle=rgb([255,225,140]); ctx.fillRect(sx+7,sy+8,1,1);               // keyhole tip
   } else if(t===T.TRAP){
-    if(revealed[ty*MAP_W+tx]){ ctx.fillStyle=rgb(C.red); ctx.fillRect(sx+3,sy+3,TILE-6,TILE-6); }
+    // visible only when located (Locate Traps / Map) or triggered — NOT when
+    // merely explored by fog-of-war, or traps would glow while you approach
+    if(trapSeen[ty*MAP_W+tx]){ ctx.fillStyle=rgb(C.red); ctx.fillRect(sx+3,sy+3,TILE-6,TILE-6); }
     else { ctx.fillStyle=rgb([26,26,38]); ctx.fillRect(sx+6,sy+6,4,4); }
   } else if(t===T.EXIT){
     const pulse=0.5+0.5*Math.sin(tGlobal*4);
@@ -1255,6 +1294,12 @@ function drawItem(it,sx,sy){
     ctx.fillRect(X-3,Y+1,2,2); ctx.fillRect(X+1,Y+1,2,2);             // bottom leaves
     ctx.fillStyle=rgb(C.lgreen); ctx.fillRect(X-1,Y-1,2,2);           // center
   }
+  else { // unknown type: generic grey gem (should never happen — keeps any
+    // future pool typo visible instead of a blank backing plate)
+    ctx.fillStyle=rgb(C.gray);
+    ctx.fillRect(X-2,Y-2,4,4); ctx.fillRect(X-1,Y-3,2,1);
+    ctx.fillRect(X-1,Y+2,2,1); ctx.fillRect(X-2,Y-1,4,2);
+  }
 }
 
 function drawSprite(img,x,y,facing){
@@ -1361,6 +1406,13 @@ function renderGameOver(){
   textC('Gold: '+score, W/2, 100, rgb(C.yellow));
   textC('[Enter] title', W/2, 122, rgb(C.white));
 }
+function renderVictory(){
+  ctx.fillStyle='rgba(0,0,0,0.72)'; ctx.fillRect(0,0,W,H);
+  textC('YOU ESCAPED!', W/2, 58, rgb(C.yellow), 3);
+  textC('The gates of Apshai close behind you.', W/2, 92, rgb(C.white));
+  textC('Gold: '+score, W/2, 108, rgb(C.yellow));
+  textC('[Enter] title', W/2, 130, rgb(C.white));
+}
 function renderCenterText(t){
   textC(t, W/2, 90, rgb(C.white), 2);
 }
@@ -1378,8 +1430,8 @@ function renderMinimap(){
       if(t===T.WALL){ r=74;g=74;b=92; }
       else if(t===T.DOOR){ r=150;g=100;b=50; }
       else if(t===T.EXIT){ r=0;g=220;b=220; }
-      else if(t===T.TRAP){ r=220;g=40;b=40; }
-      else { r=30;g=30;b=42; }   // floor / secret
+      else if(t===T.TRAP && trapSeen[ty*MAP_W+tx]){ r=220;g=40;b=40; }
+      else { r=30;g=30;b=42; }   // floor / secret / unlocated trap
     }
     const i=(ty*MAP_W+tx)*4; d[i]=r; d[i+1]=g; d[i+2]=b; d[i+3]=255;
   }
@@ -1423,6 +1475,7 @@ function render(){
   if(state==='title'){ renderTitle(); return; }
   renderPlay();
   if(state==='over') renderGameOver();
+  else if(state==='victory') renderVictory();
   if(panel) renderPanel();
   else if(menu) renderMenu();
   else if(paused) renderCenterText('PAUSED');
@@ -1464,6 +1517,15 @@ requestAnimationFrame(loop);
     keys[dirs[(Math.random()*dirs.length)|0]]=true;
     if(Math.random()<0.5) just['Space']=true;
   },240);
+})();
+
+/* ?level=N&dungeon=M — start directly in that dungeon (testing shortcut,
+   e.g. apshai.html?level=8&dungeon=16 jumps straight to the final boss) */
+(function(){
+  const q=new URLSearchParams(location.search);
+  const lv=parseInt(q.get('level'),10), dn=parseInt(q.get('dungeon'),10);
+  if(!lv||!dn) return;
+  startGame(lv,dn);   // startGame clamps to 1..8 / 1..16
 })();
 </script>
 </body>
