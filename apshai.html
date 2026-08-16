@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GATEWAY - a dungeon crawler (original HTML5 tribute)</title>
+<style>
+  html,body{margin:0;height:100%;background:#0a0a12;color:#cfd2ff;
+    font-family:"Courier New",monospace;overflow:hidden;
+    display:flex;align-items:center;justify-content:center;}
+  #wrap{display:flex;flex-direction:column;align-items:center;gap:6px;}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;
+    background:#000;border:2px solid #2a2a44;
+    width:min(92vw, calc(92vh * 1.6));height:auto;aspect-ratio:320/200;}
+  #hint{font-size:12px;opacity:.75;letter-spacing:.5px;text-align:center;}
+  #hint b{color:#ffd76a;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="320" height="200"></canvas>
+  <div id="hint">
+    <b>Move</b> Arrows/WASD &middot; <b>Attack</b> Space/X &middot;
+    <b>Menu</b> M &middot; <b>Potion</b> P &middot; <b>Weapon</b> F &middot; <b>Map</b> K &middot; <b>Sound</b> Z &middot; <b>Pause</b> Esc
+  </div>
+</div>
+<script>
+"use strict";
+/* GATEWAY - an ORIGINAL single-file dungeon crawler in the spirit of the
+   1983 C64 game. Art, procedural maps, text and name are original. The
+   systems (stats, treasure=material x level, 6:30 timer, action menus) are
+   genre conventions, not copied assets. */
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+const W = 320, H = 200;
+const TILE = 16;
+const MAP_W = 48, MAP_H = 34;
+
+const T = { WALL:0, FLOOR:1, DOOR:2, TRAP:3, SECRET:4, EXIT:5 };
+
+/* C64-ish palette */
+const C = {
+  black:[0,0,0], white:[220,220,220], red:[200,50,50], cyan:[80,200,220],
+  purple:[160,80,200], green:[60,200,80], blue:[50,80,200], yellow:[220,200,60],
+  orange:[220,140,60], brown:[150,100,50], lred:[230,120,120],
+  dgray:[80,80,92], gray:[150,150,160], lgreen:[140,220,120],
+  lblue:[120,160,235], lgray:[200,200,205]
+};
+const rgb = a => 'rgb('+a[0]+','+a[1]+','+a[2]+')';
+
+// ============ AUDIO (procedural WebAudio chiptune, no assets) ============
+let AC=null, master=null, muted=false;
+let musicOn=false, musicKind='dungeon', musicStep=0, musicNextT=0, musicTimer=null;
+function audioInit(){
+  if(AC) return;
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    master=AC.createGain(); master.gain.value=0.15; master.connect(AC.destination);
+  }catch(e){ AC=null; }
+}
+function beep(freq,dur,type,vol,slide,delay){
+  if(!AC||muted) return;
+  type=type||'square'; vol=vol==null?1:vol; slide=slide||0; delay=delay||0;
+  const t=AC.currentTime+delay;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type; o.frequency.setValueAtTime(freq,t);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide),t+dur);
+  g.gain.setValueAtTime(vol,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t+dur+0.02);
+}
+function noiseBurst(dur,vol,delay){
+  if(!AC||muted) return;
+  vol=vol==null?1:vol; delay=delay||0;
+  const t=AC.currentTime+delay;
+  const len=Math.max(1,(AC.sampleRate*dur)|0);
+  const buf=AC.createBuffer(1,len,AC.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*(1-i/len);
+  const s=AC.createBufferSource(); s.buffer=buf;
+  const f=AC.createBiquadFilter(); f.type='highpass'; f.frequency.value=800;
+  const g=AC.createGain(); g.gain.value=vol;
+  s.connect(f); f.connect(g); g.connect(master); s.start(t);
+}
+const SFX={
+  swing(){ noiseBurst(0.08,0.5); },
+  shoot(){ beep(700,0.08,'square',0.4,-400); },
+  hit(){ beep(400,0.06,'square',0.6); },
+  kill(){ beep(500,0.12,'square',0.5,-300); },
+  hurt(){ beep(200,0.25,'sawtooth',0.7,-150); },
+  die(){ beep(300,0.6,'sawtooth',0.8,-260); noiseBurst(0.4,0.4,0.1); },
+  pickup(){ beep(523,0.06,'square',0.5); beep(784,0.1,'square',0.5,0,0.06); },
+  treasure(){ beep(523,0.06,'square',0.5); beep(659,0.06,'square',0.5,0,0.06); beep(784,0.12,'square',0.5,0,0.12); },
+  door(){ beep(120,0.15,'sine',0.8,-40); },
+  trap(){ beep(160,0.3,'square',0.7,-80); },
+  spell(){ beep(400,0.3,'sine',0.5,600); },
+  select(){ beep(880,0.04,'square',0.3); },
+  move(){ beep(440,0.03,'square',0.2); },
+  levelup(){ [523,659,784,1047].forEach((f,i)=>beep(f,0.12,'square',0.5,0,i*0.09)); },
+  boss(){ [200,200,262,330].forEach((f,i)=>beep(f,0.15,'sawtooth',0.5,0,i*0.12)); }
+};
+// --- music: 8-bar (64 eighth-note steps) loops, square lead + triangle bass (SID style)
+const mf = m => 440*Math.pow(2,(m-69)/12);
+const MUSIC={
+  dungeon:{bpm:110,
+    bass:[45,0,45,0,45,0,45,0, 41,0,41,0,41,0,41,0, 48,0,48,0,43,0,43,0, 45,0,45,0,40,0,40,0,
+          45,0,45,0,45,0,45,0, 41,0,41,0,43,0,43,0, 48,0,48,0,43,0,43,0, 40,0,40,0,40,0,40,0],
+    mel:[69,0,72,0,76,0,72,0, 74,0,72,0,69,0,0,0, 72,0,76,0,79,0,76,0, 74,0,72,0,69,0,0,0,
+         69,0,72,0,76,0,72,0, 74,0,72,0,69,0,0,0, 71,0,74,0,77,0,74,0, 76,0,74,0,72,0,0,0]},
+  boss:{bpm:132,
+    bass:[45,45,0,45,45,0,45,45, 41,41,0,41,41,0,41,41, 48,48,0,48,43,43,0,43, 45,45,0,45,40,40,0,40,
+          45,45,0,45,45,0,45,45, 41,41,0,41,43,43,0,43, 48,48,0,48,43,43,0,43, 40,40,0,40,40,40,0,40],
+    mel:[69,0,72,0,76,0,72,0, 74,0,72,0,69,0,0,0, 72,0,76,0,79,0,76,0, 74,0,72,0,69,0,0,0,
+         69,0,72,0,76,0,72,0, 74,0,72,0,69,0,0,0, 71,0,74,0,77,0,74,0, 76,0,74,0,72,0,0,0]}
+};
+function musicNote(midi,t,dur,type,vol){
+  if(!AC) return;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type; o.frequency.value=mf(midi);
+  g.gain.setValueAtTime(vol,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t+dur+0.02);
+}
+function startMusic(kind){
+  if(!AC) return;
+  stopMusic();
+  musicOn=true; musicKind=kind; musicStep=0;
+  musicNextT=AC.currentTime+0.1;
+  musicTimer=setInterval(musicTick,25);
+}
+function musicTick(){
+  if(!musicOn||!AC) return;
+  const pat=MUSIC[musicKind], stepDur=60/pat.bpm/2;   // eighth notes
+  if(musicNextT < AC.currentTime-0.2) musicNextT=AC.currentTime+0.05;   // resync after tab throttle
+  while(musicNextT < AC.currentTime+0.12){
+    if(!muted){
+      const b=pat.bass[musicStep%64]; if(b) musicNote(b,musicNextT,stepDur*0.9,'triangle',0.5);
+      const l=pat.mel[musicStep%64];  if(l) musicNote(l,musicNextT,stepDur*0.95,musicKind==='boss'?'sawtooth':'square',0.22);
+    }
+    musicNextT+=stepDur; musicStep++;
+  }
+}
+function stopMusic(){ musicOn=false; if(musicTimer){ clearInterval(musicTimer); musicTimer=null; } }
+
+/* ---- crisp 5x7 bitmap font (integer fillRect -> sharp, no anti-alias) --- */
+const FONT = {
+' ': ["00000","00000","00000","00000","00000","00000","00000"],
+'!':["00100","00100","00100","00100","00100","00000","00100"],
+'"':["01010","01010","00000","00000","00000","00000","00000"],
+"'" :["00100","00100","00000","00000","00000","00000","00000"],
+'(' :["00010","00100","01000","01000","01000","00100","00010"],
+')' :["01000","00100","00010","00010","00010","00100","01000"],
+'*':["00000","10101","01110","11111","01110","10101","00000"],
+'+':["00000","00100","00100","11111","00100","00100","00000"],
+',':["00000","00000","00000","00000","01100","00100","01000"],
+'-':["00000","00000","00000","11111","00000","00000","00000"],
+'.':["00000","00000","00000","00000","00000","01100","01100"],
+'/':["00001","00010","00010","00100","01000","01000","10000"],
+':':["00000","01100","01100","00000","01100","01100","00000"],
+';':["00000","01100","01100","00000","01100","00100","10000"],
+'?':["01110","10001","00001","00110","00100","00000","00100"],
+'[':["00110","00100","00100","00100","00100","00100","00110"],
+']':["01100","00010","00010","00010","00010","00010","01100"],
+'0':["01110","10001","10011","10101","11001","10001","01110"],
+'1':["00100","01100","00100","00100","00100","00100","01110"],
+'2':["01110","10001","00001","00110","01000","10000","11111"],
+'3':["11111","00010","00100","00010","00001","10001","01110"],
+'4':["00010","00110","01010","10010","11111","00010","00010"],
+'5':["11111","10000","11110","00001","00001","10001","01110"],
+'6':["00110","01000","10000","11110","10001","10001","01110"],
+'7':["11111","00001","00010","00100","01000","01000","01000"],
+'8':["01110","10001","10001","01110","10001","10001","01110"],
+'9':["01110","10001","10001","01111","00001","00010","01100"],
+'A':["01110","10001","10001","11111","10001","10001","10001"],
+'B':["11110","10001","10001","11110","10001","10001","11110"],
+'C':["01110","10001","10000","10000","10000","10001","01110"],
+'D':["11100","10010","10001","10001","10001","10010","11100"],
+'E':["11111","10000","10000","11110","10000","10000","11111"],
+'F':["11111","10000","10000","11110","10000","10000","10000"],
+'G':["01110","10001","10000","10111","10001","10001","01111"],
+'H':["10001","10001","10001","11111","10001","10001","10001"],
+'I':["01110","00100","00100","00100","00100","00100","01110"],
+'J':["00111","00010","00010","00010","00010","10010","01100"],
+'K':["10001","10010","10100","11000","10100","10010","10001"],
+'L':["10000","10000","10000","10000","10000","10000","11111"],
+'M':["10001","11011","10101","10101","10001","10001","10001"],
+'N':["10001","10001","11001","10101","10011","10001","10001"],
+'O':["01110","10001","10001","10001","10001","10001","01110"],
+'P':["11110","10001","10001","11110","10000","10000","10000"],
+'Q':["01110","10001","10001","10001","10101","10010","01101"],
+'R':["11110","10001","10001","11110","10100","10010","10001"],
+'S':["01111","10000","10000","01110","00001","00001","11110"],
+'T':["11111","00100","00100","00100","00100","00100","00100"],
+'U':["10001","10001","10001","10001","10001","10001","01110"],
+'V':["10001","10001","10001","10001","10001","01010","00100"],
+'W':["10001","10001","10001","10101","10101","11011","10001"],
+'X':["10001","10001","01010","00100","01010","10001","10001"],
+'Y':["10001","10001","01010","00100","00100","00100","00100"],
+'Z':["11111","00001","00010","00100","01000","10000","11111"],
+'a':["00000","00000","01110","00001","01111","10001","01111"],
+'b':["10000","10000","10110","11001","10001","10001","11110"],
+'c':["00000","00000","01110","10000","10000","10001","01110"],
+'d':["00001","00001","01101","10011","10001","10001","01111"],
+'e':["00000","00000","01110","10001","11111","10000","01110"],
+'f':["00110","01001","01000","11100","01000","01000","01000"],
+'g':["00000","01111","10001","10001","01111","00001","01110"],
+'h':["10000","10000","10110","11001","10001","10001","10001"],
+'i':["00100","00000","01100","00100","00100","00100","01110"],
+'j':["00010","00000","00110","00010","00010","10010","01100"],
+'k':["10000","10000","10010","10100","11000","10100","10010"],
+'l':["01100","00100","00100","00100","00100","00100","01110"],
+'m':["00000","00000","11010","10101","10101","10001","10001"],
+'n':["00000","00000","10110","11001","10001","10001","10001"],
+'o':["00000","00000","01110","10001","10001","10001","01110"],
+'p':["00000","00000","11110","10001","11110","10000","10000"],
+'q':["00000","00000","01101","10011","01101","00001","00001"],
+'r':["00000","00000","10110","11001","10000","10000","10000"],
+'s':["00000","00000","01111","10000","01110","00001","11110"],
+'t':["01000","01000","11100","01000","01001","01001","00110"],
+'u':["00000","00000","10001","10001","10001","10011","01101"],
+'v':["00000","00000","10001","10001","10001","01010","00100"],
+'w':["00000","00000","10001","10001","10101","10101","01010"],
+'x':["00000","00000","10001","01010","00100","01010","10001"],
+'y':["00000","00000","10001","10001","01111","00001","01110"],
+'z':["00000","00000","11111","00010","00100","01000","11111"],
+};
+function text(str,x,y,color,scale){
+  scale=scale||1; str=String(str); ctx.fillStyle=color; let cx=x;
+  for(let i=0;i<str.length;i++){
+    const g=FONT[str[i]];
+    if(g) for(let r=0;r<7;r++) for(let c=0;c<5;c++)
+      if(g[r][c]==='1') ctx.fillRect(Math.round(cx+c*scale), Math.round(y+r*scale), scale, scale);
+    cx+=6*scale;
+  }
+}
+function textW(str,scale){ scale=scale||1; return String(str).length*6*scale-scale; }
+function textC(str,cx,y,color,scale){ scale=scale||1; text(str, Math.round(cx-textW(str,scale)/2), y, color, scale); }
+function textOutlined(str,x,y,color,scale){
+  scale=scale||1;
+  text(str,x-1,y,rgb(C.black),scale); text(str,x+1,y,rgb(C.black),scale);
+  text(str,x,y-1,rgb(C.black),scale); text(str,x,y+1,rgb(C.black),scale);
+  text(str,x,y,color,scale);
+}
+
+/* ---- pixel sprites (legend -> palette) --------------------------------- */
+const LEGEND = {
+  '.':null, k:[12,12,14], w:[235,235,235], r:[200,50,50], c:[80,200,220],
+  p:[160,80,200], g:[70,190,90], b:[60,110,220], y:[230,210,70],
+  o:[222,164,112], n:[140,95,50], R:[230,120,120], d:[80,80,92],
+  s:[172,172,182], G:[150,220,130], B:[130,170,235], S:[212,212,218]
+};
+const HERO = [
+"....ssss....","...ssssss...","...soooos...","...soooos...",
+"....oooo....","..bbbbbbbb..",".bbbbbbbbbb.",".bbbbbbbbbb.",
+"..bbbbbbbb..","..nnnnnnnn..","...nn..nn...","...nn..nn...",
+"..nnn..nnn..","..nnn..nnn.."
+];
+const GOBLIN = [
+".gg......gg.",".ggg....ggg.","..gggggggg..","..gkggggkg..",
+"..gggggggg..","...grrrrg...","..gggggggg..",".gggggggggg.",
+".gg..gg..gg.",".gg..gg..gg.","gg....gg....","............"
+];
+const ORC = [
+"..nnnnnnnnnn..",".nnnnnnnnnnnn.",".nnknnnnnnknn.",".nnnnnnnnnnnn.",
+".nnnnrrrrnnnn.","..nnnnnnnnnn..",".rrrrrrrrrrrr.","rrrrrrrrrrrrrr",
+"rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",".nnn....nnn...",".nnn....nnn...",
+"nnnn....nnnn..","nnnn....nnnn.."
+];
+const RAT = [
+"............","....ssss....","...ssssss...","..ssksskss..",
+"..ssssssss..","...ssssss...","....ssss....","..s..ss..s..",
+".s...ss...s.","............","............","............"
+];
+const SLIME = [
+"............","............","....gggg....","...gggggg...",
+"..ggkggkgg..","..gggggggg..",".gggggggggg.",".gggggggggg.",
+"gggggggggggg","gggggggggggg","............","............"
+];
+const BAT = [
+"p............p","pp..........pp","ppp........ppp","pppppppppppppp",
+".ppkppppppkp.","..pppppppppp..","...pppppppp...","............",
+"............","............","............","............"
+];
+const SKELETON = [
+"....wwww....","...wwwwww...","...wkwwkw...","...wwwwww...",
+"....wwww....","..wwwwwwww..",".ww.wwww.ww.",".ww.wwww.ww.",
+"....wwww....","...ww..ww...","...ww..ww...","...ww..ww..."
+];
+const DRAGON = [
+".rr........rr.",".rrr......rrr.","..rrrrrrrrrr..","..rwkrrrrkwr..",
+"..rrrrrrrrrr..",".rrrrrrrrrrrr.","rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",
+"..rrrrrrrrrr..","..rr..rr..rr..","..rr..rr..rr..","............"
+];
+const BOSS = [
+"..y......y....",".yy......yy...",".yyy....yyy...","..yyyyyyyy....",
+"..ykyyyyky....","..yyyyyyyy....",".rrrrrrrrrrr..","rrrrrrrrrrrrrr",
+"rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",".nnn....nnn...",".nnn....nnn...",
+"nnnn....nnnn..","nnnn....nnnn.."
+];
+function makeSprite(rows){
+  const h=rows.length, w=rows[0].length;
+  const c=document.createElement('canvas'); c.width=w; c.height=h;
+  const x=c.getContext('2d');
+  for(let j=0;j<h;j++)for(let i=0;i<w;i++){
+    const col=LEGEND[rows[j][i]];
+    if(col){ x.fillStyle=rgb(col); x.fillRect(i,j,1,1); }
+  }
+  return c;
+}
+const SPR = { hero:makeSprite(HERO), goblin:makeSprite(GOBLIN), orc:makeSprite(ORC),
+  rat:makeSprite(RAT), slime:makeSprite(SLIME), bat:makeSprite(BAT),
+  ghoul:makeSprite(SKELETON), mummy:makeSprite(SKELETON), dragon:makeSprite(DRAGON),
+  boss:makeSprite(BOSS) };
+// monster types without a dedicated sprite get a tinted blob
+const MON_TINT = { snake:C.green, fungus:C.lgreen, caverat:C.gray, spider:C.dgray,
+  ogre:C.brown, priest:C.lblue, vampire:C.purple, warrior:C.lred, ghost:C.lgray };
+function blobSprite(col){
+  const c=document.createElement('canvas'); c.width=12; c.height=12;
+  const x=c.getContext('2d'); x.fillStyle=rgb(col);
+  x.fillRect(3,2,6,6); x.fillRect(2,4,8,5); x.fillRect(4,9,4,2);
+  x.fillStyle=rgb([12,12,14]); x.fillRect(4,4,1,1); x.fillRect(7,4,1,1);
+  return c;
+}
+for(const t in MON_TINT) SPR[t]=blobSprite(MON_TINT[t]);
+const mmcv = document.createElement('canvas'); mmcv.width=MAP_W; mmcv.height=MAP_H; const mmctx=mmcv.getContext('2d');
+
+/* ---- seeded RNG (deterministic dungeons, like the original) ------------ */
+function mulberry32(a){
+  return function(){
+    a|=0; a=a+0x6D2B79F5|0;
+    let t=Math.imul(a^a>>>15,1|a);
+    t=t+Math.imul(t^t>>>7,61|t)^t;
+    return ((t^t>>>14)>>>0)/4294967296;
+  };
+}
+
+/* ---- dungeon generation ------------------------------------------------ */
+let map, rooms, trapDone, revealed, trapType;
+function genDungeon(level, dungeon){
+  const rng = mulberry32(level*7919 + dungeon*104729 + 12345);
+  map = new Uint8Array(MAP_W*MAP_H).fill(T.WALL);
+  rooms = [];
+  const target = 9 + Math.floor(rng()*4);
+  let guard = 0;
+  while(rooms.length<target && guard++<400){
+    const rw=4+Math.floor(rng()*6), rh=3+Math.floor(rng()*5);
+    const rx=1+Math.floor(rng()*(MAP_W-rw-2)), ry=1+Math.floor(rng()*(MAP_H-rh-2));
+    let ok=true;
+    for(const o of rooms){
+      if(rx<o.x+o.w+1 && rx+rw+1>o.x && ry<o.y+o.h+1 && ry+rh+1>o.y){ ok=false; break; }
+    }
+    if(!ok) continue;
+    const room={x:rx,y:ry,w:rw,h:rh,cx:rx+(rw>>1),cy:ry+(rh>>1)};
+    rooms.push(room);
+    for(let y=ry;y<ry+rh;y++)for(let x=rx;x<rx+rw;x++) map[y*MAP_W+x]=T.FLOOR;
+  }
+  const carve=(x,y)=>{ if(x>0&&y>0&&x<MAP_W-1&&y<MAP_H-1) map[y*MAP_W+x]=T.FLOOR; };
+  for(let i=1;i<rooms.length;i++){
+    const a=rooms[i-1], b=rooms[i];
+    if(rng()<0.5){
+      for(let x=Math.min(a.cx,b.cx);x<=Math.max(a.cx,b.cx);x++) carve(x,a.cy);
+      for(let y=Math.min(a.cy,b.cy);y<=Math.max(a.cy,b.cy);y++) carve(b.cx,y);
+    }else{
+      for(let y=Math.min(a.cy,b.cy);y<=Math.max(a.cy,b.cy);y++) carve(a.cx,y);
+      for(let x=Math.min(a.cx,b.cx);x<=Math.max(a.cx,b.cx);x++) carve(x,b.cy);
+    }
+  }
+  trapDone = new Uint8Array(MAP_W*MAP_H);
+  revealed = new Uint8Array(MAP_W*MAP_H);
+  trapType = new Uint8Array(MAP_W*MAP_H);
+  placeEntities(level, dungeon, rng);
+}
+
+/* ---- game state -------------------------------------------------------- */
+let p, monsters, items, projectiles, dmgNums;
+let level, dungeon, score, timeLeft, titleDungeon=0;
+let state='title', flash=0, flashT=0, msgQ=[], panel=null, menu=false, menuIdx=0, spellMenu=false, spellIdx=0, paused=false, tGlobal=0, minimap=true;
+
+const WEAPONS = {
+  dagger:{name:'Dagger', wp:1},
+  shortsword:{name:'Short Sword', wp:2},
+  longsword:{name:'Long Sword', wp:3},
+  twohand:{name:"2-Hand Sword", wp:4},
+  bow:{name:'Bow', wp:0}
+};
+const ARMORS = {
+  leather:{name:'Leather Armor', ap:1},
+  chain:{name:'Chain Armor', ap:2},
+  breast:{name:'Breast Armor', ap:3},
+  plate:{name:'Plate Armor', ap:4}
+};
+const SHIELDS = {
+  small:{name:'Small Shield', sp:1},
+  large:{name:'Large Shield', sp:2}
+};
+// Monster types, level-gated. hp/armor/weapon power + AI (walk/berzerk/confuse).
+// Undead types take +3 from a Cross. (Inspired by the original's monster list.)
+const MONSTERS = {
+  rat:    {name:'Swamp Rat',   lv:1, hp:2,  wp:2,  armor:0, spd:55, ai:'walk',    undead:false},
+  snake:  {name:'Garter Snake',lv:1, hp:3,  wp:1,  armor:0, spd:45, ai:'walk',    undead:false},
+  fungus: {name:'Fungus',      lv:1, hp:2,  wp:3,  armor:0, spd:20, ai:'confuse', undead:false},
+  bat:    {name:'Bat',         lv:1, hp:1,  wp:1,  armor:0, spd:60, ai:'confuse', undead:false},
+  caverat:{name:'Cave Rat',    lv:2, hp:3,  wp:3,  armor:1, spd:55, ai:'walk',    undead:false},
+  slime:  {name:'Slime',       lv:2, hp:3,  wp:6,  armor:2, spd:20, ai:'confuse', undead:false},
+  spider: {name:'Spider',      lv:2, hp:5,  wp:3,  armor:1, spd:40, ai:'walk',    undead:false},
+  ghoul:  {name:'Ghoul',       lv:3, hp:3,  wp:4,  armor:2, spd:35, ai:'confuse', undead:true},
+  ogre:   {name:'Ogre',        lv:3, hp:5,  wp:6,  armor:2, spd:30, ai:'walk',    undead:false},
+  goblin: {name:'Goblin',      lv:3, hp:3,  wp:3,  armor:0, spd:55, ai:'berzerk', undead:false},
+  mummy:  {name:'Mummy',       lv:4, hp:5,  wp:7,  armor:2, spd:30, ai:'walk',    undead:true},
+  priest: {name:'Priest',      lv:4, hp:7,  wp:9,  armor:1, spd:30, ai:'walk',    undead:false},
+  vampire:{name:'Vampire',     lv:6, hp:12, wp:18, armor:2, spd:45, ai:'berzerk', undead:true},
+  warrior:{name:'Warrior',     lv:7, hp:20, wp:25, armor:5, spd:40, ai:'berzerk', undead:false},
+  dragon: {name:'Dragon',      lv:8, hp:25, wp:30, armor:6, spd:40, ai:'walk',    undead:false},
+  boss:   {name:'Boss',        lv:1, hp:15, wp:6,  armor:2, spd:30, ai:'walk',    undead:false, boss:true}
+};
+const MONSTER_TYPES = Object.keys(MONSTERS).filter(t=>t!=='boss');
+// Trap types by level (damage like a monster attack, or freeze). Max 16 per dungeon.
+const TRAPS = {
+  pit:    {name:'Pit Trap',     lv:1, dmg:[1,3]},
+  stone:  {name:'Stone Trap',   lv:2, dmg:[2,8]},
+  freeze: {name:'Freeze Trap',  lv:4, freeze:5},
+  death:  {name:'Death Trap',   lv:8, death:true}
+};
+const TRAP_TYPES = Object.keys(TRAPS);
+// Spell items (v1.5). Durations use the original's unit U = 0.5s.
+const SPELLS = {
+  stun:    {name:'Stun Spell',    lv:1, dur:()=>((p.luck+p.agi+p.wand)/2)},
+  confuse: {name:'Confuse Spell', lv:2, dur:Infinity},
+  map:     {name:'Map',           lv:2, dur:Infinity},
+  protect: {name:'Protect Spell', lv:6, dur:()=>(p.luck+p.wand)*10},
+  blast:   {name:'Blast Spell',   lv:8, dur:Infinity},
+  teleport:{name:'Teleport Spell',lv:6, dur:Infinity}
+};
+const SPELL_TYPES = Object.keys(SPELLS);
+// Boss for each level's final dungeon (dungeon 16). (v1.5)
+const BOSSES = {
+  1:{name:'Giant',    hp:15, wp:6,  armor:2, spd:30, r:8},
+  2:{name:'Ogre',     hp:18, wp:8,  armor:3, spd:28, r:8},
+  3:{name:'Giant',    hp:22, wp:10, armor:3, spd:30, r:9},
+  4:{name:'Priest',   hp:20, wp:12, armor:2, spd:32, r:8},
+  5:{name:'Warrior',  hp:28, wp:16, armor:5, spd:35, r:9},
+  6:{name:'Vampire',  hp:30, wp:18, armor:3, spd:42, r:9},
+  7:{name:'Warlord',  hp:34, wp:22, armor:6, spd:38, r:10},
+  8:{name:'Dragon',   hp:45, wp:28, armor:6, spd:40, r:10}
+};
+// Item pools by level (inspired by the original's item distribution). v1.5 adds spells.
+const ITEM_POOLS = {
+  1:['bow','arrows','shortsword','potion','stun'],
+  2:['small','chain','potion','confuse','map'],
+  3:['longsword','large','luck','agility'],
+  4:['magicarrows','helm'],
+  5:['twohand','breast','strength','cross'],
+  6:['magicshield','wand','protect','teleport'],
+  7:['magicarmor'],
+  8:['magicarmor','blast']
+};
+const MATS = [
+  {name:'Lead', v:0, col:C.gray},
+  {name:'Iron', v:10, col:C.lgray},
+  {name:'Bronze', v:25, col:C.orange},
+  {name:'Silver', v:50, col:C.white},
+  {name:'Gold', v:100, col:C.yellow},
+  {name:'Jeweled', v:1000, col:C.purple}
+];
+const TREAS = ['Necklace','Chest','Coffer','Chalice','Sceptre','Crown','Plaque'];
+
+function newPlayer(){
+  const base={ x:0,y:0,r:5, facing:'down', anim:0, moving:false,
+    str:3, agi:3, luck:3, hp:9, lives:5,
+    weapons:['dagger'], weaponIdx:0, arrows:0, magicArrows:0, keys:0, potions:0, spells:{},
+    armor:'leather', shield:null, cross:false, wand:0, freezeT:0,
+    stunT:0, confuseT:0, protectT:0,
+    attackCd:0, swing:0, invuln:0 };
+  const c=window.__carry; // carry inventory + stats across dungeons (heal full)
+  if(c){
+    base.weapons=c.weapons.slice(); base.weaponIdx=Math.min(c.weaponIdx,base.weapons.length-1);
+    base.arrows=c.arrows; base.magicArrows=c.magicArrows||0; base.keys=c.keys; base.potions=c.potions;
+    base.armor=c.armor; base.shield=c.shield; base.cross=c.cross; base.wand=c.wand||0;
+    base.spells=c.spells?Object.assign({},c.spells):{};
+    base.stunT=c.stunT||0; base.confuseT=c.confuseT||0; base.protectT=c.protectT||0;
+    base.str=c.str; base.agi=c.agi; base.luck=c.luck;
+  }
+  base.hp=base.str+base.agi+base.luck;
+  return base;
+}
+function weapon(){ return WEAPONS[p.weapons[p.weaponIdx]]; }
+function maxHp(){ return p.str+p.agi+p.luck; }
+
+function mkMonster(type,x,y,lv){
+  const t=MONSTERS[type];
+  return {type, x, y, r:5, hp:t.hp, spd:t.spd, wp:t.wp, armor:t.armor, aggro:80, lose:150, aggroed:false,
+    attackCd:0, hitT:0, wanderT:0, wvx:0, wvy:0, confuseT:0, freezeT:0, boss:false,
+    anim:Math.random()*10, moving:false};
+}
+// pick a monster type for the level: 2 of each type in this level, rest random from <=level
+function pickMonsterTypes(lv, rng){
+  const inLv=MONSTER_TYPES.filter(t=>MONSTERS[t].lv===lv);
+  const below=MONSTER_TYPES.filter(t=>MONSTERS[t].lv<lv);
+  const out=[];
+  for(const t of inLv) out.push(t,t);            // 2 of each current-level type
+  while(out.length<8){                            // fill the rest from current+below
+    const pool=inLv.concat(below);
+    out.push(pool[(rng()*pool.length)|0]);
+  }
+  return out;
+}
+function mkItem(x,y,rng,lv){
+  // distribution inspired by the original: guaranteed arrows + level items + random
+  const pool=ITEM_POOLS[lv]||ITEM_POOLS[1];
+  const type=pool[(rng()*pool.length)|0];
+  const base={type,x,y};
+  if(type==='arrows') base.n=5+((rng()*4)|0);        // +[5;8]
+  if(type==='magicarrows') base.n=5+((rng()*4)|0);
+  return base;
+}
+// fixed treasure distribution per dungeon: 3 each of lead/iron/bronze/silver/gold, 1 jeweled
+function mkTreasures(rng){
+  const out=[];
+  const counts=[0,0,0,0,0,1];                         // lead,iron,bronze,silver,gold,jeweled
+  for(let i=0;i<5;i++) counts[i]=3;
+  for(let mi=0;mi<6;mi++) for(let k=0;k<counts[mi];k++){
+    const mat=MATS[mi];
+    out.push({type:'treasure',x:0,y:0,mat:mat.name,value:mat.v,
+      kind:TREAS[(rng()*TREAS.length)|0],col:mat.col,
+      trapped:(mi===4&&rng()<0.5)||(mi===5)});        // 50% gold, 100% jeweled trapped
+  }
+  return out;
+}
+
+/* place player, exit, monsters, items, doors, traps, secrets */
+function pickRoom(rng){ return rooms.length<=1? rooms[0] : rooms[1+Math.floor(rng()*(rooms.length-1))]; }
+function placeEntities(level, dungeon, rng){
+  p=newPlayer();
+
+  const s=rooms[0];
+  p.x=(s.cx+0.5)*TILE; p.y=(s.cy+0.5)*TILE;
+  const e=rooms[rooms.length-1];
+  map[e.cy*MAP_W+e.cx]=T.EXIT;
+  const exitI=e.cy*MAP_W+e.cx;
+  // random spot inside a room, never on the gate tile
+  const spotIn=(r)=>{
+    let x,y,t,tries=0;
+    do{
+      x=(r.x+1+Math.floor(rng()*(r.w-2))+0.5)*TILE;
+      y=(r.y+1+Math.floor(rng()*(r.h-2))+0.5)*TILE;
+      t=Math.floor(y/TILE)*MAP_W+Math.floor(x/TILE);
+      tries++;
+    }while(t===exitI && tries<8);
+    if(t===exitI) x+=TILE;   // fallback: nudge off the gate (still inside the room)
+    return [x,y];
+  };
+  monsters=[];
+  // 8 monsters per dungeon: 2 of each current-level type + random from <=level
+  const mtypes=pickMonsterTypes(level, rng);
+  const usedRooms=new Set();
+  for(const type of mtypes){
+    let r,tries=0;
+    do{ r=pickRoom(rng); tries++; }while(usedRooms.has(r) && r!==rooms[0] && tries<20);
+    usedRooms.add(r);
+    const [x,y]=spotIn(r);
+    monsters.push(mkMonster(type,x,y,level));
+  }
+  // boss guards the final dungeon of each level (dungeon 16), near the exit
+  if(dungeon===16){
+    const b=BOSSES[level];
+    const e=rooms[rooms.length-1];
+    const bx=(e.cx+1+((rng()*2)|0))*TILE, by=(e.cy+0.5)*TILE;
+    const boss=mkMonster('boss',bx,by,level);
+    boss.hp=b.hp; boss.spd=b.spd; boss.r=b.r; boss.boss=true; boss.wp=b.wp; boss.armor=b.armor;
+    boss.aggro=200; boss.lose=9999;   // boss always chases
+    monsters.push(boss);
+    SFX.boss(); startMusic('boss');
+    msg('A '+b.name+' guards the gate!');
+  }
+  items=[];
+  // 16 treasures with fixed quality distribution (gold/jeweled may be trapped)
+  for(const tr of mkTreasures(rng)){
+    const r=pickRoom(rng);
+    [tr.x,tr.y]=spotIn(r);
+    items.push(tr);
+  }
+  // level items: guaranteed arrows + (level+2) random items from <=level
+  const placeItem=(it)=>{ const r=pickRoom(rng); [it.x,it.y]=spotIn(r); items.push(it); };
+  placeItem({type:'arrows',x:0,y:0,n:6+((rng()*8)|0)});
+  for(let i=0;i<level+2;i++) placeItem(mkItem(0,0,rng,level));
+  // --- doors (solvable, clustered) ---
+  // A door only blocks the start->exit path if it sits on every open route.
+  // We test that with a BFS that treats doors as walls; if the exit is still
+  // reachable, the door is safe to place. Doors are kept apart (no two adjacent)
+  // so you never get a wall of doors. Each placed door gets its own key, dropped
+  // on an open floor tile (never inside a wall).
+  const open=(tx,ty)=>{ const t=tileAt(tx,ty); return t!==T.WALL && t!==T.DOOR; };
+  const reachExit=(sx,sy)=>{
+    const seen=new Uint8Array(MAP_W*MAP_H), q=[[sx,sy]]; seen[sy*MAP_W+sx]=1;
+    for(let h=0;h<q.length;h++){
+      const [cx,cy]=q[h];
+      if(cx===e.cx&&cy===e.cy) return true;
+      const n=[[cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]];
+      for(const [nx,ny] of n){
+        if(nx<0||ny<0||nx>=MAP_W||ny>=MAP_H) continue;
+        if(seen[ny*MAP_W+nx]||!open(nx,ny)) continue;
+        seen[ny*MAP_W+nx]=1; q.push([nx,ny]);
+      }
+    }
+    return false;
+  };
+  const cand=[];
+  for(let ty=1;ty<MAP_H-1;ty++)for(let tx=1;tx<MAP_W-1;tx++){
+    if(tileAt(tx,ty)!==T.FLOOR) continue;
+    const L=open(tx-1,ty),R=open(tx+1,ty),U=open(tx,ty-1),D=open(tx,ty+1);
+    if((L&&R&&!U&&!D)||(U&&D&&!L&&!R)) cand.push([tx,ty]);
+  }
+  // shuffle candidates so door positions vary per dungeon
+  for(let i=cand.length-1;i>0;i--){ const j=(rng()*(i+1))|0; const t=cand[i];cand[i]=cand[j];cand[j]=t; }
+  const doorSet=[];
+  const nearDoor=(tx,ty)=>doorSet.some(([dx,dy])=>Math.abs(dx-tx)<=1&&Math.abs(dy-ty)<=1);
+  let placed=0;
+  for(const [tx,ty] of cand){
+    if(placed>=4) break;
+    if(nearDoor(tx,ty)) continue;                 // keep doors apart
+    map[ty*MAP_W+tx]=T.DOOR;
+    if(reachExit(s.cx,s.cy)){ placed++; doorSet.push([tx,ty]); }   // safe: exit reachable
+    else map[ty*MAP_W+tx]=T.FLOOR;                // would trap the exit: remove
+  }
+  // traps: (level+2) random traps of level <= current, max 16 per dungeon
+  const trapCount=Math.min(16, level+2);
+  const trapPool=TRAP_TYPES.filter(t=>TRAPS[t].lv<=level);
+  let traps=0;
+  for(let i=0;i<MAP_W*MAP_H && traps<trapCount;i++){
+    const idx=Math.floor(rng()*MAP_W*MAP_H);
+    const tx=idx%MAP_W, ty=(idx/MAP_W)|0;
+    if(map[idx]===T.FLOOR && !(tx===s.cx&&ty===s.cy)){ map[idx]=T.TRAP; traps++; }
+  }
+  // assign a trap type to each trap tile
+  for(let i=0;i<MAP_W*MAP_H;i++) if(map[i]===T.TRAP) trapType[i]=trapPool[(rng()*trapPool.length)|0];
+  let secs=0;
+  for(let i=0;i<MAP_W*MAP_H && secs<6;i++){
+    const idx=Math.floor(rng()*MAP_W*MAP_H);
+    const tx=idx%MAP_W, ty=(idx/MAP_W)|0;
+    if(map[idx]===T.FLOOR){
+      const wall=(map[ty*MAP_W+tx-1]===T.WALL||map[ty*MAP_W+tx+1]===T.WALL||
+                  map[(ty-1)*MAP_W+tx]===T.WALL||map[(ty+1)*MAP_W+tx]===T.WALL);
+      if(wall){ map[idx]=T.SECRET; secs++; }
+    }
+  }
+  // drop one key per door on a clean FLOOR tile (never a wall, trap, secret,
+  // or the exit). Placed last, so only final FLOOR tiles are considered.
+  for(let i=0;i<placed;i++){
+    let kx,ky,tries=0;
+    do{ kx=1+((rng()*(MAP_W-2))|0); ky=1+((rng()*(MAP_H-2))|0); tries++; }
+    while(tileAt(kx,ky)!==T.FLOOR && tries<500);
+    items.push({type:'key',x:(kx+0.5)*TILE,y:(ky+0.5)*TILE});
+  }
+  // final pass: reposition any key (from mkItem too) that landed on a non-floor tile
+  for(const it of items) if(it.type==='key'){
+    let tx=Math.floor(it.x/TILE), ty=Math.floor(it.y/TILE);
+    if(tileAt(tx,ty)===T.FLOOR) continue;
+    let tries=0;
+    do{ tx=1+((rng()*(MAP_W-2))|0); ty=1+((rng()*(MAP_H-2))|0); tries++; }
+    while(tileAt(tx,ty)!==T.FLOOR && tries<500);
+    it.x=(tx+0.5)*TILE; it.y=(ty+0.5)*TILE;
+  }
+}
+
+function newLevel(lv,dn){
+  level=lv; dungeon=dn;
+  genDungeon(lv,dn);
+  timeLeft=390; projectiles=[]; msgQ=[]; dmgNums=[]; panel=null; menu=false; menuIdx=0; minimap=true;
+}
+function startGame(){
+  score=0; window.__carry=null; p=newPlayer();
+  newLevel(1,1);
+  state='play'; paused=false;
+  startMusic('dungeon');
+}
+
+/* ---- input ------------------------------------------------------------- */
+const keys={}, just={};
+window.addEventListener('keydown',e=>{
+  if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  audioInit(); if(AC && AC.state==='suspended') AC.resume();   // unlock audio on first gesture
+  if(!keys[e.code]) just[e.code]=true;
+  keys[e.code]=true;
+  onKey(e.code);
+});
+window.addEventListener('keyup',e=>{ keys[e.code]=false; });
+
+// Dynamic spell menu: only spells the player has collected (v1.5 fix)
+function spellMenuList(){
+  return Object.keys(p.spells).filter(t=>p.spells[t]>0).map(t=>({label:SPELLS[t].name+(p.spells[t]>1?' x'+p.spells[t]:''), act:()=>{ castSpell(t); p.spells[t]--; }}));
+}
+const MENU = [
+  {label:'Status',        act:showStatus},
+  {label:'Drink Potion',  act:usePotion},
+  {label:'Cycle Weapon',  act:cycleWeapon},
+  {label:'Spells',        act:()=>{ if(Object.values(p.spells).some(v=>v>0)){ spellMenu=true; spellIdx=0; } else msg('No spells found'); }},
+  {label:'Locate Traps',  act:locateTraps},
+  {label:'Search Secret', act:searchSecret},
+  {label:'Drop Item',     act:dropItem},
+  {label:'Next Level',    act:()=>advanceLevel('menu')},
+  {label:'Close',         act:()=>{ menu=false; spellMenu=false; }}
+];
+
+function onKey(code){
+  if(code==='KeyZ'){ muted=!muted; if(master) master.gain.value=muted?0:0.15; msg(muted?'Sound off':'Sound on'); return; }
+  if(state==='title'){
+    if(code==='ArrowUp'||code==='KeyW'){ titleDungeon=(titleDungeon+15)%16; SFX.move(); }
+    if(code==='ArrowDown'||code==='KeyS'){ titleDungeon=(titleDungeon+1)%16; SFX.move(); }
+    if(code==='Enter'||code==='Space'){ SFX.select(); startGame(); }
+    return;
+  }
+  if(state==='over'){ if(code==='Enter'||code==='Space'){ SFX.select(); state='title'; } return; }
+  if(panel){ if(code==='KeyM'||code==='Enter'||code==='Space'||code==='Escape'){ panel=null; SFX.select(); } return; }
+  // menu handling (before Escape/pause so Esc closes menus, not pauses)
+  if(menu){
+    if(code==='KeyM'){ menu=false; spellMenu=false; SFX.select(); return; }
+    if(spellMenu){
+      const list=spellMenuList();
+      if(!list.length){ spellMenu=false; return; }        // inventory emptied: close submenu
+      if(spellIdx>=list.length) spellIdx=list.length-1;   // clamp after a cast shrinks the list
+      if(code==='ArrowUp'||code==='KeyW'){ spellIdx=(spellIdx+list.length-1)%list.length; SFX.move(); }
+      if(code==='ArrowDown'||code==='KeyS'){ spellIdx=(spellIdx+1)%list.length; SFX.move(); }
+      if(code==='Escape'){ spellMenu=false; SFX.select(); return; }
+      if(code==='Enter'||code==='Space'){ SFX.select(); list[spellIdx].act(); if(!Object.values(p.spells).some(v=>v>0)) spellMenu=false; }
+      return;
+    }
+    if(code==='Escape'){ menu=false; spellMenu=false; SFX.select(); return; }
+    if(code==='ArrowUp'||code==='KeyW'){ menuIdx=(menuIdx+MENU.length-1)%MENU.length; SFX.move(); }
+    if(code==='ArrowDown'||code==='KeyS'){ menuIdx=(menuIdx+1)%MENU.length; SFX.move(); }
+    if(code==='Enter'||code==='Space'){ SFX.select(); MENU[menuIdx].act(); }
+    return;
+  }
+  if(code==='Escape'){ paused=!paused; SFX.select(); return; }
+  if(paused) return;
+  if(code==='KeyM'){ menu=!menu; menuIdx=0; spellMenu=false; SFX.select(); return; }
+  if(code==='KeyK'){ minimap=!minimap; return; }
+  if(code==='KeyP') usePotion();
+  if(code==='KeyF') cycleWeapon();
+}
+
+/* ---- tile / collision / LOS ------------------------------------------- */
+function tileAt(tx,ty){ if(tx<0||ty<0||tx>=MAP_W||ty>=MAP_H) return T.WALL; return map[ty*MAP_W+tx]; }
+function setTile(tx,ty,v){ if(tx>=0&&ty>=0&&tx<MAP_W&&ty<MAP_H) map[ty*MAP_W+tx]=v; }
+function isSolid(tx,ty){ const t=tileAt(tx,ty); return t===T.WALL||t===T.DOOR; }
+function collides(e){
+  const r=e.r;
+  const x0=Math.floor((e.x-r)/TILE), x1=Math.floor((e.x+r)/TILE);
+  const y0=Math.floor((e.y-r)/TILE), y1=Math.floor((e.y+r)/TILE);
+  for(let ty=y0;ty<=y1;ty++)for(let tx=x0;tx<=x1;tx++) if(isSolid(tx,ty)) return true;
+  return false;
+}
+function moveEntity(e,dx,dy){
+  e.x+=dx; if(collides(e)) e.x-=dx;
+  e.y+=dy; if(collides(e)) e.y-=dy;
+}
+function lineOfSight(x0,y0,x1,y1){
+  const d=Math.hypot(x1-x0,y1-y0), steps=Math.max(1,Math.ceil(d/8));
+  for(let i=1;i<steps;i++){ const t=i/steps;
+    if(isSolid(Math.floor((x0+(x1-x0)*t)/TILE),Math.floor((y0+(y1-y0)*t)/TILE))) return false; }
+  return true;
+}
+
+/* ---- actions (menu + shortcuts) --------------------------------------- */
+function clearJust(){ for(const k in just) delete just[k]; }
+function msg(text){ msgQ.push({text,t:2.2}); if(msgQ.length>4) msgQ.shift(); }
+function usePotion(){
+  if(p.potions>0 && p.hp<maxHp()){ p.potions--; p.hp=Math.min(maxHp(),p.hp+4); msg('Potion: +4 HP'); }
+  else msg('No potions');
+}
+function cycleWeapon(){
+  if(p.weapons.length<2){ msg('Only one weapon'); return; }
+  p.weaponIdx=(p.weaponIdx+1)%p.weapons.length;
+  msg('Weapon: '+weapon().name);
+}
+function dropItem(){
+  if(p.weapons.length>1){
+    const w=p.weapons.splice(p.weaponIdx,1)[0];
+    if(p.weaponIdx>=p.weapons.length) p.weaponIdx=0;
+    items.push({type:w,x:p.x,y:p.y});
+    msg('Dropped '+WEAPONS[w].name);
+  } else msg('Nothing to drop');
+}
+function locateTraps(){
+  let n=0;
+  for(let ty=0;ty<MAP_H;ty++)for(let tx=0;tx<MAP_W;tx++)
+    if(map[ty*MAP_W+tx]===T.TRAP){ revealed[ty*MAP_W+tx]=1; n++; }
+  msg(n?('Found '+n+' trap'+(n>1?'s':'')):'No traps here');
+}
+function searchSecret(){
+  const cx=Math.floor(p.x/TILE), cy=Math.floor(p.y/TILE);
+  for(let ry=-3;ry<=3;ry++)for(let rx=-3;rx<=3;rx++){
+    const tx=cx+rx, ty=cy+ry;
+    if(tileAt(tx,ty)===T.SECRET){
+      setTile(tx,ty,T.FLOOR);
+      items.push(mkItem((tx+0.5)*TILE,(ty+0.5)*TILE,Math.random,level));
+      msg('Secret found!'); return;
+    }
+  }
+  msg('No secret nearby');
+}
+// ---- spells (v1.5) ----
+function castSpell(type){
+  const s=SPELLS[type];
+  if(!s) return;
+  SFX.spell();
+  const U=0.5; // original duration unit
+  switch(type){
+    case 'stun':
+      p.stunT=(s.dur()||1)*U; monsters.forEach(m=>m.freezeT=p.stunT);
+      msg('Stun: monsters frozen'); flash=1; flashT=0.2; break;
+    case 'confuse':
+      monsters.forEach(m=>{ if(lineOfSight(m.x,m.y,p.x,p.y)) m.confuseT=9999; });
+      msg('Confuse: monsters lost'); flash=1; flashT=0.2; break;
+    case 'map':
+      for(let i=0;i<MAP_W*MAP_H;i++) revealed[i]=1;
+      msg('Map revealed'); break;
+    case 'protect':
+      p.protectT=(s.dur()||1)*U; msg('Protect: traps disabled'); flash=1; flashT=0.2; break;
+    case 'teleport': {
+      const cx=Math.floor(p.x/TILE), cy=Math.floor(p.y/TILE);
+      let bx,by,tries=0;
+      do{ bx=1+((rng0()*(MAP_W-2))|0); by=1+((rng0()*(MAP_H-2))|0); tries++; }
+      while((tileAt(bx,by)!==T.FLOOR || (Math.abs(bx-cx)<MAP_W*0.25 && Math.abs(by-cy)<MAP_H*0.25)) && tries<300);
+      p.x=(bx+0.5)*TILE; p.y=(by+0.5)*TILE; p.invuln=1; msg('Teleported!'); flash=1; flashT=0.2; break;
+    }
+    case 'blast': {
+      // tunnel a corridor in the facing direction (up to 3 tiles)
+      const dx=dirX(p.facing), dy=dirY(p.facing);
+      const cx=Math.floor(p.x/TILE), cy=Math.floor(p.y/TILE);
+      for(let i=1;i<=3;i++) setTile(cx+dx*i, cy+dy*i, T.FLOOR);
+      msg('Blast!'); flash=1; flashT=0.25; break;
+    }
+  }
+}
+let _rng0seed=12345;
+function rng0(){ _rng0seed=(_rng0seed*1103515245+12345)&0x7fffffff; return _rng0seed/0x7fffffff; }
+function showStatus(){
+  panel={ title:'STATUS', lines:[
+    'Strength  '+p.str, 'Agility   '+p.agi, 'Luck      '+p.luck,
+    'Health    '+p.hp+' / '+maxHp(), 'Lives     '+p.lives,
+    'Weapon    '+weapon().name, 'Arrows    '+p.arrows+'  M'+p.magicArrows,
+    'Armor     '+ARMORS[p.armor].name,
+    'Shield    '+(p.shield?SHIELDS[p.shield].name:'None'),
+    'Cross     '+(p.cross?'Yes':'No'), 'Wand      '+p.wand,
+    'Keys      '+p.keys, 'Potions   '+p.potions, 'Gold      '+score,
+    'Spells    '+(Object.keys(p.spells).filter(t=>p.spells[t]>0).length?Object.keys(p.spells).filter(t=>p.spells[t]>0).map(t=>t.toUpperCase()+(p.spells[t]>1?'x'+p.spells[t]:'')).join(','):'None')
+  ]};
+  menu=false;
+}
+function advanceLevel(how){
+  let dn=dungeon+1, lv=level;
+  if(dn>16){ dn=1; lv++; if(lv>8) lv=8; }
+  window.__carry={weapons:p.weapons.slice(),weaponIdx:p.weaponIdx,arrows:p.arrows,magicArrows:p.magicArrows,keys:p.keys,potions:p.potions,spells:Object.assign({},p.spells),str:p.str,agi:p.agi,luck:p.luck,armor:p.armor,shield:p.shield,cross:p.cross,wand:p.wand,stunT:p.stunT,confuseT:p.confuseT,protectT:p.protectT};
+  newLevel(lv,dn);
+  if(dn!==16) startMusic('dungeon');
+  SFX.levelup();
+  msg(how==='exit'?'You found the gate!':'On to the next dungeon...');
+}
+
+/* ---- combat helpers ---------------------------------------------------- */
+function dirX(f){ return f==='left'?-1:f==='right'?1:0; }
+function dirY(f){ return f==='up'?-1:f==='down'?1:0; }
+function inFront(mx,my){
+  const dx=mx-p.x, dy=my-p.y;
+  if(p.facing==='left')  return dx<-4 && Math.abs(dy)<15;
+  if(p.facing==='right') return dx>4  && Math.abs(dy)<15;
+  if(p.facing==='up')    return dy<-4 && Math.abs(dx)<15;
+  if(p.facing==='down')  return dy>4  && Math.abs(dx)<15;
+  return false;
+}
+function addDmgNum(x,y,amt,color,scale){ dmgNums.push({x,y,amt,color,scale:scale||1,life:scale&&scale>1?0.9:0.7}); }
+function updateDmgNums(dt){
+  for(let i=dmgNums.length-1;i>=0;i--){
+    const d=dmgNums[i]; d.life-=dt; d.y-=24*dt;
+    if(d.life<=0) dmgNums.splice(i,1);
+  }
+}
+function tryAttack(){
+  if(p.attackCd>0 || p.freezeT>0) return;
+  p.attackCd=0.32; p.swing=0.16;
+  const cur=p.weapons[p.weaponIdx];
+  if(cur==='bow'){
+    // bow: magic arrows (8 dmg) take priority over normal arrows (4 dmg)
+    if(p.magicArrows>0){ p.magicArrows--; SFX.shoot(); projectiles.push({x:p.x,y:p.y,dx:dirX(p.facing)*230,dy:dirY(p.facing)*230,life:1.1,dmg:8,magic:true}); }
+    else if(p.arrows>0){ p.arrows--; SFX.shoot(); projectiles.push({x:p.x,y:p.y,dx:dirX(p.facing)*230,dy:dirY(p.facing)*230,life:1.1,dmg:4,magic:false}); }
+    else SFX.swing();
+    return;
+  }
+  // melee: damage = weapon power + strength/4 (+3 vs undead if Cross) - monster armor
+  SFX.swing();
+  const wp=weapon().wp + Math.floor(p.str/4) + (p.cross?3:0);
+  let hit=false;
+  for(const m of monsters){
+    const d=Math.hypot(m.x-p.x,m.y-p.y);
+    if(d<24 && inFront(m.x,m.y)){
+      const dmg=Math.max(1, wp - MONSTERS[m.type].armor);
+      m.hp-=dmg; m.hitT=0.15; addDmgNum(m.x,m.y-6,dmg,C.yellow); hit=true;
+      if(m.hp<=0) killMonster(m); else SFX.hit();
+    }
+  }
+  if(hit){ flash=1; flashT=0.18; }
+}
+function killMonster(m){
+  const i=monsters.indexOf(m); if(i>=0) monsters.splice(i,1); score+=5;
+  if(m.boss){ SFX.die(); startMusic('dungeon'); }
+  else SFX.kill();
+}
+// monster attack: hit chance = (1..31) > agility; damage = wp - armor - shield
+// (- level if a 1..31 roll < luck). Gauntlet/helm don't reduce damage (simplified).
+function monsterAttack(m){
+  const roll=1+Math.floor(Math.random()*31);
+  if(roll<=p.agi) return;                            // player dodged (no flash)
+  const wp=m.wp||MONSTERS[m.type].wp;
+  let dmg=wp - ARMORS[p.armor].ap - (p.shield?SHIELDS[p.shield].sp:0);
+  if(1+Math.floor(Math.random()*31) < p.luck) dmg-=level;   // lucky bonus
+  damagePlayer(Math.max(0,dmg));
+}
+function damagePlayer(n){
+  if(p.invuln>0) return;
+  p.hp-=n; p.invuln=0.6; flash=2; flashT=0.22;
+  if(n>0){ addDmgNum(p.x, p.y-8, n, C.red); SFX.hurt(); }
+  if(p.hp<=0){
+    p.lives--;
+    if(p.lives<=0){ state='over'; SFX.die(); stopMusic(); }
+    else { p.hp=maxHp(); const s=rooms[0]; p.x=(s.cx+0.5)*TILE; p.y=(s.cy+0.5)*TILE; p.invuln=2; SFX.die(); msg('You were slain!'); }
+  }
+}
+
+/* ---- per-frame update -------------------------------------------------- */
+function triggerTrap(type){
+  const t=TRAPS[type];
+  if(!t) return;
+  SFX.trap();
+  if(t.death){ damagePlayer(999); msg('Death trap!'); return; }
+  if(t.freeze){ p.freezeT=t.freeze; msg('Frozen!'); return; }
+  const dmg=t.dmg[0]+Math.floor(Math.random()*(t.dmg[1]-t.dmg[0]+1));
+  monsterAttackDmg(dmg);                              // like a monster attack (armor/shield/luck apply)
+  msg(t.name+'!');
+}
+// trap damage path: applies armor/shield/luck like a monster hit (no hit-chance roll)
+function monsterAttackDmg(baseDmg){
+  let dmg=baseDmg - ARMORS[p.armor].ap - (p.shield?SHIELDS[p.shield].sp:0);
+  if(1+Math.floor(Math.random()*31) < p.luck) dmg-=level;
+  damagePlayer(Math.max(0,dmg));
+}
+// Reveal tiles within a radius of the player (fog of war)
+function revealAround(cx,cy,r){
+  for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+    const tx=cx+dx, ty=cy+dy;
+    if(tx>=0&&ty>=0&&tx<MAP_W&&ty<MAP_H) revealed[ty*MAP_W+tx]=1;
+  }
+}
+function updatePlayer(dt){
+  if(p.freezeT>0){ p.freezeT-=dt; p.moving=false; if(p.attackCd>0)p.attackCd-=dt; if(p.invuln>0)p.invuln-=dt; return; }
+  let dx=0,dy=0;
+  if(keys.ArrowLeft||keys.KeyA)dx-=1;
+  if(keys.ArrowRight||keys.KeyD)dx+=1;
+  if(keys.ArrowUp||keys.KeyW)dy-=1;
+  if(keys.ArrowDown||keys.KeyS)dy+=1;
+  if(dx&&dy){ dx*=0.7071; dy*=0.7071; }
+  const spd=90*(1+p.agi*0.05);
+  p.moving=(dx||dy);
+  if(dx) p.facing=dx>0?'right':'left';
+  if(dy) p.facing=dy>0?'down':'up';
+  moveEntity(p, dx*spd*dt, dy*spd*dt);
+  if(p.moving) p.anim+=dt*12;
+  if(p.attackCd>0)p.attackCd-=dt;
+  if(p.swing>0)p.swing-=dt;
+  if(p.invuln>0)p.invuln-=dt;
+  if(p.stunT>0)p.stunT-=dt;
+  if(p.confuseT>0)p.confuseT-=dt;
+  if(p.protectT>0)p.protectT-=dt;
+
+  const tx=Math.floor(p.x/TILE), ty=Math.floor(p.y/TILE);
+  revealAround(tx,ty,3);   // fog of war: reveal 3-tile radius
+  const t=tileAt(tx,ty);
+  if(t===T.TRAP && !trapDone[ty*MAP_W+tx] && p.protectT<=0){ trapDone[ty*MAP_W+tx]=1; revealed[ty*MAP_W+tx]=1; triggerTrap(trapType[ty*MAP_W+tx]); }
+  if(t===T.EXIT){ advanceLevel('exit'); return; }
+
+  const fx=tx+dirX(p.facing), fy=ty+dirY(p.facing);
+  if(tileAt(fx,fy)===T.DOOR){
+    const d=Math.hypot((fx+0.5)*TILE-p.x,(fy+0.5)*TILE-p.y);
+    if(p.keys>0 && d<TILE*1.6){ p.keys--; setTile(fx,fy,T.FLOOR); SFX.door(); msg('Door opened'); }
+  }
+
+  if(just['Space']||just['KeyX']) tryAttack();
+}
+
+function updateMonsters(dt){
+  for(const m of monsters){
+    if(m.hitT>0)m.hitT-=dt;
+    if(m.attackCd>0)m.attackCd-=dt;
+    if(m.freezeT>0){ m.freezeT-=dt; continue; }       // frozen: immobile
+    const t=MONSTERS[m.type];
+    const d=Math.hypot(p.x-m.x,p.y-m.y);
+    if(d<m.aggro && lineOfSight(m.x,m.y,p.x,p.y)) m.aggroed=true;
+    if(m.aggroed && d>m.lose) m.aggroed=false;
+    let vx=0,vy=0, spd=t.spd;
+    if(m.aggroed && d>1){ vx=(p.x-m.x)/d; vy=(p.y-m.y)/d;
+      if(t.ai==='berzerk' && d<8*TILE) spd+=20;        // berzerk: speeds up close
+      if(t.ai==='confuse' || m.confuseT>0){ m.confuseT-=dt; if(m.confuseT<=0){ m.confuseT=0.6+Math.random(); const a=Math.random()*6.283; vx=Math.cos(a); vy=Math.sin(a); } }
+    }
+    else if(!m.aggroed){
+      m.wanderT-=dt;
+      if(m.wanderT<=0){ m.wanderT=1+Math.random()*2; const a=Math.random()*6.283; m.wvx=Math.cos(a); m.wvy=Math.sin(a); }
+      vx=m.wvx; vy=m.wvy;
+    }
+    moveEntity(m, vx*spd*dt, vy*spd*dt);
+    m.moving=(vx||vy);
+    if(m.moving) m.anim+=dt*12;   // walk bob, same rate as hero (per-monster phase offset)
+    if(d<(p.r+m.r+1) && m.attackCd<=0){ m.attackCd=0.8; monsterAttack(m); }
+  }
+}
+
+function updateProjectiles(dt){
+  for(let i=projectiles.length-1;i>=0;i--){
+    const pr=projectiles[i];
+    pr.x+=pr.dx*dt; pr.y+=pr.dy*dt; pr.life-=dt;
+    let dead=pr.life<=0;
+    if(isSolid(Math.floor(pr.x/TILE),Math.floor(pr.y/TILE))) dead=true;
+    if(!dead) for(const m of monsters){
+      if(Math.hypot(m.x-pr.x,m.y-pr.y)<m.r+3){
+        const dmg=Math.max(1, pr.dmg - MONSTERS[m.type].armor);
+        m.hp-=dmg; m.hitT=0.15; addDmgNum(m.x,m.y-6,dmg,C.cyan); if(m.hp<=0)killMonster(m); dead=true; break;
+      }
+    }
+    if(dead) projectiles.splice(i,1);
+  }
+}
+
+function updateItems(){
+  for(let i=items.length-1;i>=0;i--){
+    const it=items[i];
+    if(Math.hypot(it.x-p.x,it.y-p.y)<p.r+6){ pickup(it); items.splice(i,1); }
+  }
+}
+function pickup(it){
+  switch(it.type){
+    case 'treasure': {
+      if(it.trapped){ triggerTrap('stone'); msg('Trapped!'); }
+      const v=it.value*level; score+=v; msg('+'+v+'  '+it.mat+' '+it.kind); SFX.treasure(); break;
+    }
+    case 'dagger': case 'shortsword': case 'longsword': case 'twohand': case 'bow':
+      if(!p.weapons.includes(it.type)){ p.weapons.push(it.type); p.weaponIdx=p.weapons.length-1; msg('Got '+WEAPONS[it.type].name); }
+      else msg('Already have '+WEAPONS[it.type].name); break;
+    case 'arrows': p.arrows+=it.n; msg('+'+it.n+' arrows'); break;
+    case 'magicarrows': p.magicArrows+=it.n; msg('+'+it.n+' magic arrows'); break;
+    case 'potion': p.potions++; msg('Potion'); break;
+    case 'key': p.keys++; msg('Key'); break;
+    case 'leather': case 'chain': case 'breast': case 'plate':
+      p.armor=it.type; msg('Wearing '+ARMORS[it.type].name); break;
+    case 'small': case 'large': p.shield=it.type; msg('Got '+SHIELDS[it.type].name); break;
+    case 'cross': p.cross=true; msg('Cross (+3 vs undead)'); break;
+    case 'strength': p.str+=2; msg('Strength +2'); break;
+    case 'agility': p.agi+=2; msg('Agility +2'); break;
+    case 'luck': p.luck+=2; msg('Luck +2'); break;
+    case 'wand': p.wand++; msg('Wand (wand power +1)'); break;
+    case 'stun': case 'confuse': case 'map': case 'protect': case 'teleport': case 'blast':
+      p.spells[it.type]=(p.spells[it.type]||0)+1; msg(SPELLS[it.type].name+' found! (M to cast)'); break;
+  }
+  if(it.type!=='treasure') SFX.pickup();
+}
+
+function update(dt){
+  tGlobal+=dt;
+  if(flashT>0)flashT-=dt;
+  for(const m of msgQ)m.t-=dt;
+  msgQ=msgQ.filter(m=>m.t>0);
+  if(state!=='play'||paused||panel||menu) return;
+  timeLeft-=dt;
+  if(timeLeft<=0){ advanceLevel('time'); return; }
+  updatePlayer(dt);
+  if(state!=='play') return;
+  updateMonsters(dt);
+  updateProjectiles(dt);
+  updateDmgNums(dt);
+  updateItems();
+}
+
+/* ---- rendering --------------------------------------------------------- */
+function camX(){ return Math.max(0,Math.min(MAP_W*TILE-W, Math.round(p.x-W/2))); }
+function camY(){ return Math.max(0,Math.min(MAP_H*TILE-H, Math.round(p.y-H/2))); }
+
+function drawTile(tx,ty,sx,sy){
+  const t=map[ty*MAP_W+tx];
+  if(t===T.WALL){
+    ctx.fillStyle=rgb([50,50,64]); ctx.fillRect(sx,sy,TILE,TILE);
+    ctx.fillStyle=rgb([80,80,100]); ctx.fillRect(sx,sy,TILE,1);          // top-edge highlight
+    ctx.fillStyle=rgb([66,66,84]); ctx.fillRect(sx,sy+1,TILE,1);
+    ctx.fillStyle=rgb([33,33,45]); ctx.fillRect(sx,sy+TILE-2,TILE,2);
+    ctx.fillRect(sx+7,sy+2,1,TILE-4);
+    return;
+  }
+  // floor: base + subtle checkerboard so rooms read as floors, not void
+  ctx.fillStyle=rgb([24,24,34]); ctx.fillRect(sx,sy,TILE,TILE);
+  if((tx+ty)&1){ ctx.fillStyle=rgb([29,29,42]); ctx.fillRect(sx,sy,TILE,TILE); }
+  ctx.fillStyle=rgb([31,31,45]); ctx.fillRect(sx+1,sy+1,TILE-2,TILE-2);
+  // sparse deterministic speckle for texture
+  const h=(tx*73856093)^(ty*19349663);
+  if((h&3)===0){ ctx.fillStyle=rgb([38,38,54]); ctx.fillRect(sx+((h>>3)&7)+2, sy+((h>>6)&7)+2, 1,1); }
+  if(t===T.DOOR){
+    // framed doorway: dark opening, wood frame, two planks, keyhole
+    ctx.fillStyle=rgb([12,10,16]); ctx.fillRect(sx+2,sy+2,TILE-4,TILE-4);      // opening
+    ctx.fillStyle=rgb([110,72,38]); ctx.fillRect(sx+1,sy+1,TILE-2,1);            // lintel
+    ctx.fillStyle=rgb([92,60,32]); ctx.fillRect(sx+1,sy+1,2,TILE-2);             // left jamb
+    ctx.fillRect(sx+TILE-3,sy+1,2,TILE-2);                                       // right jamb
+    ctx.fillStyle=rgb([150,100,50]); ctx.fillRect(sx+5,sy+3,2,TILE-6);           // plank L
+    ctx.fillStyle=rgb([132,86,44]); ctx.fillRect(sx+9,sy+3,2,TILE-6);            // plank R
+    ctx.fillStyle=rgb(C.yellow); ctx.fillRect(sx+7,sy+6,2,2);                    // keyhole
+    ctx.fillStyle=rgb([255,225,140]); ctx.fillRect(sx+7,sy+8,1,1);               // keyhole tip
+  } else if(t===T.TRAP){
+    if(revealed[ty*MAP_W+tx]){ ctx.fillStyle=rgb(C.red); ctx.fillRect(sx+3,sy+3,TILE-6,TILE-6); }
+    else { ctx.fillStyle=rgb([26,26,38]); ctx.fillRect(sx+6,sy+6,4,4); }
+  } else if(t===T.EXIT){
+    const pulse=0.5+0.5*Math.sin(tGlobal*4);
+    ctx.fillStyle=rgb(C.cyan); ctx.fillRect(sx+2,sy+2,TILE-4,TILE-4);
+    ctx.fillStyle='rgba(255,255,255,'+(0.3+0.5*pulse).toFixed(2)+')';
+    ctx.fillRect(sx+5,sy+5,TILE-10,TILE-10);
+  }
+}
+function renderMap(cx,cy){
+  const x0=Math.floor(cx/TILE), y0=Math.floor(cy/TILE);
+  const x1=Math.min(MAP_W-1, x0+Math.ceil(W/TILE)+1);
+  const y1=Math.min(MAP_H-1, y0+Math.ceil(H/TILE)+1);
+  for(let ty=y0;ty<=y1;ty++)for(let tx=x0;tx<=x1;tx++)
+    drawTile(tx,ty, tx*TILE-cx, ty*TILE-cy);
+}
+
+function drawItem(it,sx,sy){
+  const t=it.type, X=Math.round(sx), Y=Math.round(sy);
+  // faint backing plate so small icons read against the floor
+  ctx.fillStyle=rgb([12,12,20]); ctx.fillRect(X-5,Y-5,10,10);
+  if(t==='treasure'){ // treasure chest, tinted by material
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-4,Y-2,8,4);            // body
+    ctx.fillStyle=rgb([110,72,38]); ctx.fillRect(X-4,Y-3,8,1);        // lid
+    ctx.fillStyle=rgb(it.col); ctx.fillRect(X-4,Y-1,8,1);             // material band
+    ctx.fillStyle=rgb(C.yellow); ctx.fillRect(X-1,Y-1,2,2);           // clasp
+  }
+  else if(t==='potion'){ // potion flask
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-1,Y-4,2,2);            // cork
+    ctx.fillStyle=rgb(C.red); ctx.fillRect(X-2,Y-2,4,4);              // neck
+    ctx.fillRect(X-3,Y+1,6,3);                                        // bulb
+    ctx.fillStyle=rgb(C.lred); ctx.fillRect(X-2,Y+1,1,2);             // shine
+  }
+  else if(t==='key'){ // key
+    ctx.fillStyle=rgb(C.yellow); ctx.fillRect(X-4,Y-2,3,3);           // bow
+    ctx.fillStyle=rgb([24,24,34]); ctx.fillRect(X-3,Y-1,1,1);         // bow hole
+    ctx.fillRect(X-1,Y-1,5,1);                                        // shaft
+    ctx.fillRect(X+3,Y,1,2); ctx.fillRect(X+1,Y,1,2);                 // teeth
+  }
+  else if(t==='arrows'){ // quiver of arrows
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-3,Y-1,6,4);            // quiver
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-2,Y-4,1,3);            // shaft 1
+    ctx.fillRect(X,Y-4,1,3);                                          // shaft 2
+    ctx.fillStyle=rgb(C.red); ctx.fillRect(X-2,Y-5,1,1);              // fletch
+    ctx.fillRect(X,Y-5,1,1);
+  }
+  else if(t==='dagger'){ // small dagger
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-1,Y-3,2,5);            // blade
+    ctx.fillStyle=rgb(C.white); ctx.fillRect(X-1,Y-3,1,5);            // edge
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-2,Y+2,4,1);            // guard
+    ctx.fillRect(X-1,Y+3,2,1);                                        // pommel
+  }
+  else if(t==='shortsword'||t==='longsword'||t==='twohand'){ // sword
+    const big=(t==='twohand');
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-1,Y-5,2,8);            // blade
+    ctx.fillStyle=rgb(C.white); ctx.fillRect(X-1,Y-5,1,8);            // edge
+    if(big){ ctx.fillStyle=rgb(C.yellow); ctx.fillRect(X-1,Y-5,2,8); } // 2-hand: golden
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-2,Y+3,4,1);            // guard
+    ctx.fillRect(X-1,Y+4,2,2);                                        // pommel
+  }
+  else if(t==='leather'||t==='chain'||t==='breast'||t==='plate'){ // armor (tunic)
+    const acol=t==='plate'?C.lgray:(t==='breast'?C.lblue:(t==='chain'?C.gray:C.brown));
+    ctx.fillStyle=rgb(acol);
+    ctx.fillRect(X-3,Y-3,6,2);                                        // shoulders
+    ctx.fillRect(X-3,Y-1,6,5);                                        // torso
+    ctx.fillStyle=rgb([20,20,30]); ctx.fillRect(X-1,Y-1,2,4);         // chest seam
+  }
+  else if(t==='small'||t==='large'){ // shield
+    const scol=t==='large'?C.lblue:C.gray;
+    ctx.fillStyle=rgb(scol); ctx.fillRect(X-3,Y-4,6,8);               // shield body
+    ctx.fillStyle=rgb([20,20,30]); ctx.fillRect(X-1,Y-4,2,8);         // center boss
+    if(t==='large'){ ctx.fillStyle=rgb(C.yellow); ctx.fillRect(X-1,Y-2,2,4); }
+  }
+  else if(t==='cross'){ // cross (undead slayer)
+    ctx.fillStyle=rgb(C.yellow); ctx.fillRect(X-1,Y-4,2,8);           // vertical
+    ctx.fillRect(X-3,Y-2,6,2);                                        // horizontal
+  }
+  else if(t==='magicarrows'){ // magic arrows (purple quiver)
+    ctx.fillStyle=rgb(C.purple); ctx.fillRect(X-3,Y-1,6,4);           // quiver
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-2,Y-4,1,3);            // shaft 1
+    ctx.fillRect(X,Y-4,1,3);                                          // shaft 2
+    ctx.fillStyle=rgb(C.purple); ctx.fillRect(X-2,Y-5,1,1);           // fletch
+    ctx.fillRect(X,Y-5,1,1);
+  }
+  else if(t==='wand'){ // wand
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-1,Y-2,2,6);            // staff
+    ctx.fillStyle=rgb(C.cyan); ctx.fillRect(X-2,Y-4,4,3);             // orb
+    ctx.fillStyle=rgb(C.white); ctx.fillRect(X-1,Y-3,1,1);            // glint
+  }
+  else if(t==='stun'){ // stun: yellow star burst
+    ctx.fillStyle=rgb(C.yellow);
+    ctx.fillRect(X-1,Y-4,2,8); ctx.fillRect(X-4,Y-1,8,2);
+    ctx.fillRect(X-3,Y-3,2,2); ctx.fillRect(X+1,Y-3,2,2);
+    ctx.fillRect(X-3,Y+1,2,2); ctx.fillRect(X+1,Y+1,2,2);
+  }
+  else if(t==='confuse'){ // confuse: purple spiral
+    ctx.fillStyle=rgb(C.purple);
+    ctx.fillRect(X-3,Y-2,6,1); ctx.fillRect(X-2,Y-1,4,1); ctx.fillRect(X-1,Y,2,1);
+    ctx.fillRect(X-3,Y+1,3,1); ctx.fillRect(X,Y-3,1,3);
+  }
+  else if(t==='map'){ // map: scroll
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-4,Y-3,8,6);
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-4,Y-3,1,6); ctx.fillRect(X+3,Y-3,1,6);
+    ctx.fillStyle=rgb(C.dgray); ctx.fillRect(X-2,Y-1,4,1); ctx.fillRect(X-2,Y+1,3,1);
+  }
+  else if(t==='protect'){ // protect: cyan shield
+    ctx.fillStyle=rgb(C.cyan); ctx.fillRect(X-3,Y-4,6,8);
+    ctx.fillStyle=rgb(C.white); ctx.fillRect(X-1,Y-2,2,4);
+  }
+  else if(t==='teleport'){ // teleport: cyan swirl
+    ctx.fillStyle=rgb(C.cyan);
+    ctx.fillRect(X-3,Y-3,6,1); ctx.fillRect(X-3,Y-3,1,6); ctx.fillRect(X+2,Y-2,1,5);
+    ctx.fillRect(X-2,Y+2,5,1); ctx.fillRect(X-1,Y-1,2,2);
+  }
+  else if(t==='blast'){ // blast: orange explosion
+    ctx.fillStyle=rgb(C.orange);
+    ctx.fillRect(X-1,Y-4,2,8); ctx.fillRect(X-4,Y-1,8,2);
+    ctx.fillRect(X-3,Y-3,2,2); ctx.fillRect(X+1,Y+1,2,2);
+    ctx.fillStyle=rgb(C.yellow); ctx.fillRect(X-1,Y-1,2,2);
+  }
+  else if(t==='bow'){ // bow: curved stave + string + nocked arrow
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X+1,Y-4,2,8);            // stave (right arc)
+    ctx.fillRect(X,Y-4,1,1); ctx.fillRect(X,Y+3,1,1);                 // tips
+    ctx.fillStyle=rgb(C.lgray); ctx.fillRect(X-1,Y-4,1,8);            // string
+    ctx.fillStyle=rgb(C.brown); ctx.fillRect(X-4,Y-1,5,1);            // arrow shaft
+    ctx.fillStyle=rgb(C.white); ctx.fillRect(X-5,Y-1,1,1);            // arrowhead
+  }
+  else if(t==='strength'){ // red diamond
+    ctx.fillStyle=rgb(C.red);
+    ctx.fillRect(X-1,Y-3,2,1); ctx.fillRect(X-2,Y-2,4,1); ctx.fillRect(X-3,Y-1,6,1);
+    ctx.fillRect(X-2,Y,4,1); ctx.fillRect(X-1,Y+1,2,1); ctx.fillRect(X,Y+2,1,1);
+  }
+  else if(t==='agility'){ // green chevron (fast-forward)
+    ctx.fillStyle=rgb(C.green);
+    ctx.fillRect(X-3,Y-3,2,6); ctx.fillRect(X-2,Y-2,2,4); ctx.fillRect(X-1,Y-1,2,2);
+    ctx.fillRect(X+1,Y-3,2,6); ctx.fillRect(X+2,Y-2,2,4); ctx.fillRect(X+3,Y-1,1,2);
+  }
+  else if(t==='luck'){ // four-leaf clover
+    ctx.fillStyle=rgb(C.green);
+    ctx.fillRect(X-3,Y-3,2,2); ctx.fillRect(X+1,Y-3,2,2);             // top leaves
+    ctx.fillRect(X-3,Y+1,2,2); ctx.fillRect(X+1,Y+1,2,2);             // bottom leaves
+    ctx.fillStyle=rgb(C.lgreen); ctx.fillRect(X-1,Y-1,2,2);           // center
+  }
+}
+
+function drawSprite(img,x,y,facing){
+  const w=img.width,h=img.height;
+  ctx.save();
+  ctx.translate(Math.round(x),Math.round(y));
+  if(facing==='left') ctx.scale(-1,1);
+  ctx.drawImage(img, -(w/2|0), -(h/2|0));
+  ctx.restore();
+}
+function drawHero(x,y){
+  if(p.invuln>0 && Math.floor(tGlobal*20)%2===0) return;
+  // walk cycle: 1px body bob on alternate frames while moving
+  const bob = (p.moving && Math.floor(p.anim)%2) ? -1 : 0;
+  drawSprite(SPR.hero,x,y+bob,p.facing);
+  ctx.fillStyle=rgb(C.lgray);
+  const bx=x+(p.facing==='left'?-9: p.facing==='right'?7: -1);
+  const by=y+bob+(p.facing==='up'?-9: p.facing==='down'?7: -1);
+  ctx.fillRect(bx,by,3,3);
+}
+function drawMonster(m,x,y,facing){
+  const bob = (m.moving && Math.floor(m.anim)%2) ? -1 : 0;
+  if(m.hitT>0) ctx.globalAlpha=0.5;
+  drawSprite(SPR[m.type]||blobSprite(C.gray),x,y+bob,facing);
+  ctx.globalAlpha=1;
+  if(m.hitT>0){
+    ctx.fillStyle=rgb(C.white);
+    ctx.fillRect(Math.round(x)-1,Math.round(y)+bob-1,3,3);
+    ctx.fillRect(Math.round(x)-4,Math.round(y)+bob,1,1);
+    ctx.fillRect(Math.round(x)+4,Math.round(y)+bob,1,1);
+    ctx.fillRect(Math.round(x),Math.round(y)+bob-4,1,1);
+  }
+}
+
+function fmtTime(s){ s=Math.max(0,Math.ceil(s)); const m=(s/60)|0; const ss=s%60; return m+':'+(ss<10?'0':'')+ss; }
+function renderHUD(){
+  ctx.fillStyle=rgb(C.black); ctx.fillRect(0,0,W,12);
+  ctx.fillStyle=rgb(C.dgray); ctx.fillRect(0,12,W,1);
+  const y=2;
+  text('L'+level+' D'+String(dungeon).padStart(2,'0'), 4,y, rgb(C.white));
+  text('HP '+p.hp+'/'+maxHp(), 42,y, rgb(p.hp<maxHp()?C.lred:C.green));
+  text('LIVES '+p.lives, 94,y, rgb(C.white));
+  text('GOLD '+score, 140,y, rgb(C.yellow));
+  text(fmtTime(timeLeft), 204,y, rgb(timeLeft<30?C.red:C.cyan));
+  const wkey=p.weapons[p.weaponIdx], wname=weapon().name.toUpperCase();
+  text(wname, 232,y, rgb(C.lgray));
+  // arrow count only when the bow is equipped, placed after the weapon name
+  if(wkey==='bow' && p.arrows>0) text('x'+p.arrows, 232+wname.length*6+4, y, rgb(C.white));
+  // mute indicator (bottom-right, clear of minimap)
+  if(muted) text('MUTED (Z)', W-56, H-10, rgb(C.red));
+  // boss health bar (v1.5): shown when a boss is alive (bottom-left, clear of minimap)
+  const boss=monsters.find(m=>m.boss);
+  if(boss){
+    const bw=70, bx=4, by=H-12, frac=Math.max(0,boss.hp/(BOSSES[level]?BOSSES[level].hp:boss.hp));
+    text((BOSSES[level]?BOSSES[level].name.toUpperCase():'BOSS'), bx, by-9, rgb(C.lred));
+    ctx.fillStyle=rgb(C.black); ctx.fillRect(bx,by,bw,4);
+    ctx.fillStyle=rgb(C.red); ctx.fillRect(bx,by,Math.round(bw*frac),4);
+    ctx.strokeStyle=rgb(C.lgray); ctx.strokeRect(bx+0.5,by+0.5,bw-1,3);
+  }
+}
+function renderMsgs(){
+  let y=H-10-msgQ.length*9;
+  for(const m of msgQ){
+    const w=textW(m.text);
+    ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(4,y-1,w+6,10);
+    ctx.fillStyle=rgb(C.yellow); text(m.text,7,y);
+    y+=9;
+  }
+}
+function renderMenu(){
+  const list=spellMenu?spellMenuList():MENU, idx=spellMenu?spellIdx:menuIdx;
+  const bw=124, bh=list.length*10+16;
+  const bx=(W-bw)/2|0, by=(H-bh)/2|0;
+  ctx.fillStyle='rgba(0,0,0,0.88)'; ctx.fillRect(bx,by,bw,bh);
+  ctx.strokeStyle=rgb(C.cyan); ctx.strokeRect(bx+0.5,by+0.5,bw-1,bh-1);
+  ctx.fillStyle=rgb(C.cyan); text(spellMenu?'SPELLS  (Esc to close)':'MENU  (M to close)', bx+6, by+4);
+  for(let i=0;i<list.length;i++){
+    ctx.fillStyle= i===idx?rgb(C.yellow):rgb(C.white);
+    text((i===idx?'> ':'  ')+list[i].label, bx+6, by+16+i*10);
+  }
+}
+function renderPanel(){
+  const bw=140, bh=panel.lines.length*10+30;
+  const bx=(W-bw)/2|0, by=(H-bh)/2|0;
+  ctx.fillStyle='rgba(0,0,0,0.92)'; ctx.fillRect(bx,by,bw,bh);
+  ctx.strokeStyle=rgb(C.yellow); ctx.strokeRect(bx+0.5,by+0.5,bw-1,bh-1);
+  ctx.fillStyle=rgb(C.yellow); text(panel.title, bx+8, by+5);
+  ctx.fillStyle=rgb(C.white);
+  for(let i=0;i<panel.lines.length;i++) text(panel.lines[i], bx+8, by+16+i*10);
+  ctx.fillStyle=rgb(C.lgray); text('(M to close)', bx+8, by+bh-10);
+}
+function renderTitle(){
+  ctx.fillStyle=rgb(C.black); ctx.fillRect(0,0,W,H);
+  textC('G A T E W A Y', W/2, 28, rgb(C.cyan), 3);
+  textC('an original dungeon crawler', W/2, 66, rgb(C.lgray));
+  textC('Dungeon: '+String(titleDungeon+1).padStart(2,'0'), W/2, 96, rgb(C.yellow));
+  textC('[Up/Down] choose    [Enter] enter', W/2, 118, rgb(C.white));
+  textC('Find treasure. Fight monsters. Beat the clock.', W/2, 150, rgb(C.dgray));
+  textC('An HTML5 tribute - not the 1983 game.', W/2, 162, rgb(C.dgray));
+}
+function renderGameOver(){
+  ctx.fillStyle='rgba(0,0,0,0.72)'; ctx.fillRect(0,0,W,H);
+  textC('GAME OVER', W/2, 66, rgb(C.red), 3);
+  textC('Gold: '+score, W/2, 100, rgb(C.yellow));
+  textC('[Enter] title', W/2, 122, rgb(C.white));
+}
+function renderCenterText(t){
+  textC(t, W/2, 90, rgb(C.white), 2);
+}
+
+function renderMinimap(){
+  if(!minimap) return;
+  const s=2, mw=MAP_W*s, mh=MAP_H*s, ox=W-mw-4, oy=16;   // bottom-right, under HUD
+  // 1px-per-tile image (drawn on the hidden canvas, scaled up 2x)
+  const img=mmctx.createImageData(MAP_W,MAP_H), d=img.data;
+  for(let ty=0;ty<MAP_H;ty++)for(let tx=0;tx<MAP_W;tx++){
+    const rev=revealed[ty*MAP_W+tx]; let r=0,g=0,b=0;
+    if(!rev){ r=8;g=8;b=12; }   // unexplored = black
+    else {
+      const t=map[ty*MAP_W+tx];
+      if(t===T.WALL){ r=74;g=74;b=92; }
+      else if(t===T.DOOR){ r=150;g=100;b=50; }
+      else if(t===T.EXIT){ r=0;g=220;b=220; }
+      else if(t===T.TRAP){ r=220;g=40;b=40; }
+      else { r=30;g=30;b=42; }   // floor / secret
+    }
+    const i=(ty*MAP_W+tx)*4; d[i]=r; d[i+1]=g; d[i+2]=b; d[i+3]=255;
+  }
+  mmctx.putImageData(img,0,0);
+  // frame + background
+  ctx.fillStyle='rgba(0,0,0,0.66)'; ctx.fillRect(ox-2,oy-2,mw+4,mh+4);
+  ctx.strokeStyle=rgb(C.lgray); ctx.strokeRect(ox-1.5,oy-1.5,mw+3,mh+3);
+  ctx.drawImage(mmcv,ox,oy,mw,mh);
+  // entities (only on revealed tiles)
+  const px=Math.round((p.x/TILE)*s), py=Math.round((p.y/TILE)*s);
+  for(const m of monsters){ const mt=Math.floor(m.y/TILE)*MAP_W+Math.floor(m.x/TILE); if(revealed[mt]){ ctx.fillStyle=rgb(C.red); ctx.fillRect(ox+Math.round((m.x/TILE)*s)-1, oy+Math.round((m.y/TILE)*s)-1, 2,2); } }
+  for(const it of items){ const it2=Math.floor(it.y/TILE)*MAP_W+Math.floor(it.x/TILE); if(revealed[it2]){ ctx.fillStyle=rgb(C.yellow); ctx.fillRect(ox+Math.round((it.x/TILE)*s), oy+Math.round((it.y/TILE)*s), 1,1); } }
+  // player (white, with outline)
+  ctx.fillStyle=rgb(C.black); ctx.fillRect(ox+px-2,oy+py-2,5,5);
+  ctx.fillStyle=rgb(C.white); ctx.fillRect(ox+px-1,oy+py-1,3,3);
+  // label
+  ctx.fillStyle=rgb(C.lgray); text('MAP (K)', ox, oy-2);
+}
+function renderPlay(){
+  const cx=camX(), cy=camY();
+  renderMap(cx,cy);
+  for(const it of items) drawItem(it, it.x-cx, it.y-cy);
+  ctx.fillStyle=rgb(C.yellow);
+  for(const pr of projectiles) ctx.fillRect(Math.round(pr.x-cx)-1, Math.round(pr.y-cy)-1,3,3);
+  for(const m of monsters) drawMonster(m, m.x-cx, m.y-cy, p.x<m.x?'left':'right');
+  drawHero(p.x-cx, p.y-cy);
+  for(const dn of dmgNums){
+    const a=Math.max(0,Math.min(1, dn.life/0.45));
+    ctx.globalAlpha=a;
+    const s=String(dn.amt);
+    textOutlined(s, Math.round(dn.x-cx-textW(s,dn.scale)/2), Math.round(dn.y-cy), rgb(dn.color), dn.scale);
+  }
+  ctx.globalAlpha=1;
+  renderHUD();
+  renderMinimap();
+  renderMsgs();
+  if(flashT>0){ ctx.fillStyle= flash===1?'rgba(60,200,80,0.25)':'rgba(200,50,50,0.30)'; ctx.fillRect(0,0,W,H); }
+}
+function render(){
+  ctx.fillStyle=rgb(C.black); ctx.fillRect(0,0,W,H);
+  if(state==='title'){ renderTitle(); return; }
+  renderPlay();
+  if(state==='over') renderGameOver();
+  if(panel) renderPanel();
+  else if(menu) renderMenu();
+  else if(paused) renderCenterText('PAUSED');
+}
+
+/* ---- main loop --------------------------------------------------------- */
+let last=performance.now();
+function loop(now){
+  let dt=(now-last)/1000; last=now;
+  if(dt>0.05) dt=0.05;
+  update(dt);
+  render();
+  clearJust();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* optional attract/demo mode: open with ?demo=1 (auto-plays a short path) */
+(function(){
+  const q=new URLSearchParams(location.search);
+  if(!q.get('demo') && !q.get('hit')) return;
+  startGame();
+  if(q.get('hit')){
+    // reliable combat preview: keep a goblin in front and swing constantly
+    p.weapons=['dagger','shortsword']; p.weaponIdx=1;
+    setInterval(()=>{
+      for(const k in keys) keys[k]=false;
+      p.facing='right';
+      let g=monsters.find(m=>m.tag==='shot');
+      if(!g || g.hp<=0){ g=mkMonster('goblin',p.x+14,p.y,1); g.tag='shot'; monsters.push(g); }
+      g.x=p.x+14; g.y=p.y; g.hp=Math.max(g.hp,2);
+      just['Space']=true;
+    },120);
+    return;
+  }
+  const dirs=['KeyW','KeyD','KeyS','KeyA'];
+  setInterval(()=>{
+    for(const k in keys) keys[k]=false;
+    keys[dirs[(Math.random()*dirs.length)|0]]=true;
+    if(Math.random()<0.5) just['Space']=true;
+  },240);
+})();
+</script>
+</body>
+</html>
