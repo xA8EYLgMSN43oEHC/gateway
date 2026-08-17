@@ -66,6 +66,14 @@ algorithm is given precisely enough to reproduce behavior.
 - **Trap visibility decoupled from fog-of-war** — traps had a separate `trapSeen[]` state: they no longer glow red when you merely walk near them (fog-of-war `revealAround` was marking their tiles explored). Now revealed only by Locate Traps, the Map spell, or triggering.
 - **"Black box" items fixed** — `ITEM_POOLS` had three dead types (`helm`, `magicshield`, `magicarmor`) with no pickup/draw handling: they rendered as a bare dark plate and vanished on pickup giving nothing (L7–8 were hit hardest). Replaced with real items (`cross`/`large`/`plate`), `mkItem` now uses the cumulative 1..lv pool (fixes 9× duplicate Plate at L7), and `drawItem` has a grey-gem fallback for unknown types.
 
+**Done in v1.8** (monster & hero animation, §15.4):
+- **Tier 1 — procedural motion:**
+  - **Smooth sine bob** — replaced the v1.5 on/off 1px bob with a sine wave (0→-2→0) for hero and monsters; same 6 bobs/s but eased instead of stepped.
+  - **Per-type idle motion** (phase-offset per monster so the group never pulses in sync): bat/ghost/dragon hover (always, even idle), slime squash & stretch, fungus scale pulse, rat/caverat/snake 2px tail wiggle.
+  - **Attack lunge** — a monster leans up to 3px toward the player for 150 ms after landing a hit (`m.lungeT`).
+  - **Death poof** — monsters no longer vanish instantly: they shrink + fade over 250 ms while 8 colored particles (18 for bosses) scatter (`poofs[]` / `updatePoofs`). Dying monsters (`m.dying`) are immune to further hits, excluded from the minimap, and removed by `updateMonsters` when the poof ends.
+- **Tier 2 — 2-frame sprites** (`SPR2`, §4.3): hero 2-frame walk (legs together ↔ stride, while moving), bat 2-frame flap (wings-up ↔ folded, ~8/s), dragon 2-frame flap (~4/s), boss 2-frame breath (body expands 1px, ~2/s). Flap/breath run on global time + per-monster phase, so they animate even while idle.
+
 **Top roadmap items** (details in §21.2): high-score persistence (`localStorage`), touch controls, and the remaining balance/look polish (see §21.2).
 
 > **Status:** v1.7 is complete and playable (see §19 for how it was verified). The items above are the planned next steps.
@@ -204,11 +212,16 @@ canvas (1px per cell).
 |   |   |   |   | `B` | `[130,170,235]` |
 |   |   |   |   | `S` | `[212,212,218]` |
 
-**Sprite sizes:** `hero` = 12×14, `goblin` = 12×12, `orc` = 14×14.
+**Sprite sizes:** `hero` = 12×14, `goblin` = 12×12, `orc` = 14×14, `bat`/`dragon` = 14×12, `boss` = 14×14.
 The exact pixel maps are in **Appendix B**.
 
 `drawSprite(img, x, y, facing)` centers the image on `(x,y)` and mirrors it
 horizontally when `facing === 'left'`.
+
+**Two-frame sprites (v1.8):** `SPR2` holds a second animation frame for `hero`
+(walk), `bat`/`dragon` (flap), and `boss` (breath). Frame-2 arrays: `HERO_WALK`,
+`BAT_FLAP`, `DRAGON_FLAP`, `BOSS_BREATH`. `drawHero`/`drawMonster` pick the frame
+from animation state (§15.4).
 
 ---
 
@@ -769,14 +782,30 @@ icon so small art reads against the floor. *(v1.2)* Then, per type:
 - `strength`: red diamond; `agility`: green chevron; `luck`: four-leaf clover.
   *(v1.1: every icon is distinct, see §21.1)*
 
-### 15.4 Hero & monster sprites
+### 15.4 Hero & monster sprites (animation, v1.8)
 - `drawHero(x,y)`: while `invuln>0`, blink (skip drawing every other 1/20s).
-  Draw the hero sprite (facing-aware) + a 3×3 lgray "sword" offset in the facing
-  direction.
-- `drawMonster(m,x,y,facing)`: §9 hit-flash handling + sprite.
+  Smooth sine bob while moving (`-round(1-cos(anim·π))`, 0→-2→0). **2-frame
+  walk**: `SPR2.hero` (stride) is drawn on alternate frames while `moving`
+  (`floor(anim)%2`), else `SPR.hero` (legs together). + a 3×3 lgray "sword"
+  offset in the facing direction.
+- `drawMonster(m,x,y,facing)`:
+  - **Sine bob** while moving (same formula as the hero).
+  - **Per-type idle motion** (phase `m.phase`, global time `tGlobal`): bat/ghost/
+    dragon hover (`-1-round(sin(tg·2.5+ph))`, always), slime squash & stretch,
+    fungus scale pulse, rat/caverat/snake 2px tail wiggle (drawn behind the body).
+  - **Attack lunge**: for `m.lungeT` (150 ms after a hit) the sprite is offset up
+    to 3px toward the player.
+  - **2-frame sprites** (v1.8): bat flaps ~8/s, dragon ~4/s, boss breathes ~2/s
+    (`floor(tg·rate+ph)%2` → `SPR2[type]`); all phase-offset and run even while idle.
+  - **Death poof**: while `m.dying>0` the sprite shrinks + fades (`scale`/`alpha`
+    = `dying/0.25`); `spawnPoof` scatters 8 particles (18 for bosses) into
+    `poofs[]`, updated by `updatePoofs` and drawn as fading 2px rects. Dying
+    monsters are skipped by melee/projectile hits and the minimap, and removed by
+    `updateMonsters` when the poof ends.
+  - §9 hit-flash (white sparkle + 0.5 alpha).
 
 *(v1.3: the 1px `spriteOutline` ring added in v1.2 was removed — it looked like a
-box around the sprites.)*
+box around the sprites. v1.5's on/off 1px bob was replaced by the sine bob in v1.8.)*
 
 ### 15.5 HUD (`renderHUD`)
 Top 12px black bar + 1px dgray line at y=12. Text baseline `y=2`, left-to-right
@@ -1172,6 +1201,34 @@ const ORC = [
 "..nnnnnnnnnn..",".nnnnnnnnnnnn.",".nnknnnnnnknn.",".nnnnnnnnnnnn.",
 ".nnnnrrrrnnnn.","..nnnnnnnnnn..",".rrrrrrrrrrrr.","rrrrrrrrrrrrrr",
 "rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",".nnn....nnn...",".nnn....nnn...",
+"nnnn....nnnn..","nnnn....nnnn.."
+];
+```
+
+**Frame-2 sprites (v1.8)** — the second animation frame for each. Body rows are
+kept identical to frame 1 so only the animated part changes (no 1px jitter).
+
+```js
+const HERO_WALK = [   // stride (legs apart); frame 1 = legs together
+"....ssss....","...ssssss...","...soooos...","...soooos...",
+"....oooo....","..bbbbbbbb..",".bbbbbbbbbb.",".bbbbbbbbbb.",
+"..bbbbbbbb..","..nnnnnnnn..","..nn...nn...",".nn.....nn..",
+".nn.....nn..","nn.......nn."
+];
+const BAT_FLAP = [    // wings folded down; frame 1 = wings up
+"..............","..............","..............",".pppppppppppp.",
+".ppkppppppkp.","..pppppppppp..","...pppppppp...","..............",
+"..............","..............","..............",".............."
+];
+const DRAGON_FLAP = [ // wings swung to a narrow V; frame 1 = wings up
+"..............",".....rrrr.....","....rrrrrr....","..rwkrrrrkwr..",
+"..rrrrrrrrrr..",".rrrrrrrrrrrr.","rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",
+"..rrrrrrrrrr..","..rr..rr..rr..","..rr..rr..rr..",".............."
+];
+const BOSS_BREATH = [ // body expanded 1px each side; frame 1 = contracted
+"..y......y....",".yy......yy...",".yyy....yyy...","..yyyyyyyy....",
+"..ykyyyyky....","..yyyyyyyy....","rrrrrrrrrrrrr.","rrrrrrrrrrrrrr",
+"rrrrrrrrrrrrrr","rrrrrrrrrrrrr.",".nnn....nnn...",".nnn....nnn...",
 "nnnn....nnnn..","nnnn....nnnn.."
 ];
 ```

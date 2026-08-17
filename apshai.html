@@ -301,6 +301,29 @@ const BOSS = [
 "rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",".nnn....nnn...",".nnn....nnn...",
 "nnnn....nnnn..","nnnn....nnnn.."
 ];
+/* Tier 2: second animation frames (hero walk, bat/dragon flap, boss breath) */
+const HERO_WALK = [
+"....ssss....","...ssssss...","...soooos...","...soooos...",
+"....oooo....","..bbbbbbbb..",".bbbbbbbbbb.",".bbbbbbbbbb.",
+"..bbbbbbbb..","..nnnnnnnn..","..nn...nn...",".nn.....nn..",
+".nn.....nn..","nn.......nn."
+];
+const BAT_FLAP = [
+"..............","..............","..............",".pppppppppppp.",
+".ppkppppppkp.","..pppppppppp..","...pppppppp...","..............",
+"..............","..............","..............",".............."
+];
+const DRAGON_FLAP = [
+"..............",".....rrrr.....","....rrrrrr....","..rwkrrrrkwr..",
+"..rrrrrrrrrr..",".rrrrrrrrrrrr.","rrrrrrrrrrrrrr",".rrrrrrrrrrrr.",
+"..rrrrrrrrrr..","..rr..rr..rr..","..rr..rr..rr..",".............."
+];
+const BOSS_BREATH = [
+"..y......y....",".yy......yy...",".yyy....yyy...","..yyyyyyyy....",
+"..ykyyyyky....","..yyyyyyyy....","rrrrrrrrrrrrr.","rrrrrrrrrrrrrr",
+"rrrrrrrrrrrrrr","rrrrrrrrrrrrr.",".nnn....nnn...",".nnn....nnn...",
+"nnnn....nnnn..","nnnn....nnnn.."
+];
 function makeSprite(rows){
   const h=rows.length, w=rows[0].length;
   const c=document.createElement('canvas'); c.width=w; c.height=h;
@@ -315,6 +338,8 @@ const SPR = { hero:makeSprite(HERO), goblin:makeSprite(GOBLIN), orc:makeSprite(O
   rat:makeSprite(RAT), slime:makeSprite(SLIME), bat:makeSprite(BAT),
   ghoul:makeSprite(SKELETON), mummy:makeSprite(SKELETON), dragon:makeSprite(DRAGON),
   boss:makeSprite(BOSS) };
+const SPR2 = { hero:makeSprite(HERO_WALK), bat:makeSprite(BAT_FLAP),
+  dragon:makeSprite(DRAGON_FLAP), boss:makeSprite(BOSS_BREATH) };
 // monster types without a dedicated sprite get a tinted blob
 const MON_TINT = { snake:C.green, fungus:C.lgreen, caverat:C.gray, spider:C.dgray,
   ogre:C.brown, priest:C.lblue, vampire:C.purple, warrior:C.lred, ghost:C.lgray };
@@ -377,7 +402,7 @@ function genDungeon(level, dungeon){
 }
 
 /* ---- game state -------------------------------------------------------- */
-let p, monsters, items, projectiles, dmgNums;
+let p, monsters, items, projectiles, dmgNums, poofs=[];
 let level, dungeon, score, timeLeft, titleDungeon=0;
 let state='title', flash=0, flashT=0, msgQ=[], panel=null, menu=false, menuIdx=0, spellMenu=false, spellIdx=0, paused=false, tGlobal=0, minimap=true;
 
@@ -495,7 +520,7 @@ function mkMonster(type,x,y,lv){
   const t=MONSTERS[type];
   return {type, x, y, r:5, hp:t.hp, spd:t.spd, wp:t.wp, armor:t.armor, aggro:80, lose:150, aggroed:false,
     attackCd:0, hitT:0, wanderT:0, wvx:0, wvy:0, confuseT:0, freezeT:0, boss:false,
-    anim:Math.random()*10, moving:false};
+    anim:Math.random()*10, moving:false, phase:Math.random()*6.283, lungeT:0, dying:0};
 }
 // pick a monster type for the level: 2 of each type in this level, rest random from <=level
 function pickMonsterTypes(lv, rng){
@@ -675,7 +700,7 @@ function placeEntities(level, dungeon, rng){
 function newLevel(lv,dn){
   level=lv; dungeon=dn;
   genDungeon(lv,dn);
-  timeLeft=390; projectiles=[]; msgQ=[]; dmgNums=[]; panel=null; menu=false; menuIdx=0; minimap=true;
+  timeLeft=390; projectiles=[]; poofs=[]; msgQ=[]; dmgNums=[]; panel=null; menu=false; menuIdx=0; minimap=true;
 }
 function startGame(lv, dn){
   lv=Math.min(8,Math.max(1,lv||1));
@@ -908,6 +933,7 @@ function tryAttack(){
   const wp=weapon().wp + Math.floor(p.str/4) + (p.cross?3:0);
   let hit=false;
   for(const m of monsters){
+    if(m.dying>0) continue;                       // already dead (poof in progress)
     const d=Math.hypot(m.x-p.x,m.y-p.y);
     if(d<24 && inFront(m.x,m.y)){
       const dmg=Math.max(1, wp - MONSTERS[m.type].armor);
@@ -917,8 +943,24 @@ function tryAttack(){
   }
   if(hit){ flash=1; flashT=0.18; }
 }
+// main body color per type (for death-poof particles)
+const MON_COLOR = Object.assign({ goblin:C.green, orc:C.lred, rat:C.gray, slime:C.lgreen,
+  bat:C.purple, dragon:C.red, boss:C.yellow }, MON_TINT);
+function spawnPoof(m){
+  const col=MON_COLOR[m.type]||C.gray;
+  const n=m.boss?18:8;
+  for(let i=0;i<n;i++){
+    const a=Math.random()*6.283, s=20+Math.random()*40;
+    poofs.push({x:m.x,y:m.y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,t:0.25+Math.random()*0.15,col});
+  }
+}
+function updatePoofs(dt){
+  for(const q of poofs){ q.x+=q.vx*dt; q.y+=q.vy*dt; q.t-=dt; }
+  poofs=poofs.filter(q=>q.t>0);
+}
 function killMonster(m){
-  const i=monsters.indexOf(m); if(i>=0) monsters.splice(i,1);
+  if(m.dying>0) return;                 // already dead
+  m.dying=0.25; spawnPoof(m);           // death animation; removed by updateMonsters
   if(m.boss){
     const pts=50*level; score+=pts;
     addDmgNum(m.x, m.y-12, pts, C.yellow, 2);   // big score number
@@ -1028,8 +1070,10 @@ function updatePlayer(dt){
 
 function updateMonsters(dt){
   for(const m of monsters){
+    if(m.dying>0){ m.dying-=dt; continue; }            // death poof in progress
     if(m.hitT>0)m.hitT-=dt;
     if(m.attackCd>0)m.attackCd-=dt;
+    if(m.lungeT>0)m.lungeT-=dt;
     if(m.freezeT>0){ m.freezeT-=dt; continue; }       // frozen: immobile
     const t=MONSTERS[m.type];
     const d=Math.hypot(p.x-m.x,p.y-m.y);
@@ -1048,8 +1092,9 @@ function updateMonsters(dt){
     moveEntity(m, vx*spd*dt, vy*spd*dt);
     m.moving=(vx||vy);
     if(m.moving) m.anim+=dt*12;   // walk bob, same rate as hero (per-monster phase offset)
-    if(d<(p.r+m.r+1) && m.attackCd<=0){ m.attackCd=0.8; monsterAttack(m); }
+    if(d<(p.r+m.r+1) && m.attackCd<=0){ m.attackCd=0.8; m.lungeT=0.15; monsterAttack(m); }
   }
+  monsters=monsters.filter(m=>m.dying>=0);            // remove finished poofs
 }
 
 function updateProjectiles(dt){
@@ -1059,6 +1104,7 @@ function updateProjectiles(dt){
     let dead=pr.life<=0;
     if(isSolid(Math.floor(pr.x/TILE),Math.floor(pr.y/TILE))) dead=true;
     if(!dead) for(const m of monsters){
+      if(m.dying>0) continue;                     // already dead
       if(Math.hypot(m.x-pr.x,m.y-pr.y)<m.r+3){
         const dmg=Math.max(1, pr.dmg - MONSTERS[m.type].armor);
         m.hp-=dmg; m.hitT=0.15; addDmgNum(m.x,m.y-6,dmg,C.cyan); if(m.hp<=0)killMonster(m); dead=true; break;
@@ -1113,6 +1159,7 @@ function update(dt){
   if(state!=='play') return;
   updateMonsters(dt);
   updateProjectiles(dt);
+  updatePoofs(dt);
   updateDmgNums(dt);
   updateItems();
 }
@@ -1313,24 +1360,57 @@ function drawSprite(img,x,y,facing){
 function drawHero(x,y){
   if(p.invuln>0 && Math.floor(tGlobal*20)%2===0) return;
   // walk cycle: 1px body bob on alternate frames while moving
-  const bob = (p.moving && Math.floor(p.anim)%2) ? -1 : 0;
-  drawSprite(SPR.hero,x,y+bob,p.facing);
+  const bob = p.moving ? -Math.round(1-Math.cos(p.anim*Math.PI)) : 0;   // smooth sine bob
+  const img = (p.moving && Math.floor(p.anim)%2) ? SPR2.hero : SPR.hero;  // 2-frame walk
+  drawSprite(img,x,y+bob,p.facing);
   ctx.fillStyle=rgb(C.lgray);
   const bx=x+(p.facing==='left'?-9: p.facing==='right'?7: -1);
   const by=y+bob+(p.facing==='up'?-9: p.facing==='down'?7: -1);
   ctx.fillRect(bx,by,3,3);
 }
 function drawMonster(m,x,y,facing){
-  const bob = (m.moving && Math.floor(m.anim)%2) ? -1 : 0;
-  if(m.hitT>0) ctx.globalAlpha=0.5;
-  drawSprite(SPR[m.type]||blobSprite(C.gray),x,y+bob,facing);
+  // smooth sine bob while moving (0 → -2 → 0, same 6/s rate as before)
+  const bob = m.moving ? -Math.round(1-Math.cos(m.anim*Math.PI)) : 0;
+  // per-type idle motion (phase-offset so the group never pulses in sync)
+  const ph=m.phase, tg=tGlobal;
+  let dx=0, dy=bob, sx=1, sy=1;
+  if(m.type==='bat'||m.type==='ghost'||m.type==='dragon')
+    dy+=-1-Math.round(Math.sin(tg*2.5+ph));          // hover (always, even idle)
+  else if(m.type==='slime'){ const s=0.12*Math.sin(tg*3+ph); sx=1+s; sy=1-s; }   // squash & stretch
+  else if(m.type==='fungus'){ const s=0.08*Math.sin(tg*2+ph); sx=1+s; sy=1+s; }  // pulse
+  // attack lunge: lean toward the player for ~150 ms after a hit
+  if(m.lungeT>0){
+    const k=3*(m.lungeT/0.15), ddx=p.x-m.x, ddy=p.y-m.y, dl=Math.hypot(ddx,ddy)||1;
+    dx+=ddx/dl*k; dy+=ddy/dl*k;
+  }
+  const X=Math.round(x+dx), Y=Math.round(y+dy);
+  // tail wiggle (drawn behind the body)
+  if(m.type==='rat'||m.type==='caverat'||m.type==='snake'){
+    const wag=Math.round(Math.sin(tg*8+ph));
+    ctx.fillStyle=rgb(MON_COLOR[m.type]||C.gray);
+    ctx.fillRect(facing==='left'?X+5:X-7, Y+wag, 2, 2);
+  }
+  // death poof: shrink + fade over 250 ms
+  let alpha=1;
+  if(m.dying>0){ const k=Math.max(0,m.dying/0.25); sx*=k; sy*=k; alpha=k; }
+  if(m.hitT>0) alpha*=0.5;
+  // Tier 2: 2-frame sprites (bat/dragon flap, boss breath) — phase-offset
+  let img = SPR[m.type]||blobSprite(C.gray);
+  if(m.type==='bat' && Math.floor(tg*8+ph)%2) img=SPR2.bat;
+  else if(m.type==='dragon' && Math.floor(tg*4+ph)%2) img=SPR2.dragon;
+  else if(m.type==='boss' && Math.floor(tg*2+ph)%2) img=SPR2.boss;
+  ctx.globalAlpha=alpha;
+  ctx.save();
+  ctx.translate(X,Y); ctx.scale(sx,sy);
+  drawSprite(img,0,0,facing);
+  ctx.restore();
   ctx.globalAlpha=1;
   if(m.hitT>0){
     ctx.fillStyle=rgb(C.white);
-    ctx.fillRect(Math.round(x)-1,Math.round(y)+bob-1,3,3);
-    ctx.fillRect(Math.round(x)-4,Math.round(y)+bob,1,1);
-    ctx.fillRect(Math.round(x)+4,Math.round(y)+bob,1,1);
-    ctx.fillRect(Math.round(x),Math.round(y)+bob-4,1,1);
+    ctx.fillRect(X-1,Y-1,3,3);
+    ctx.fillRect(X-4,Y,1,1);
+    ctx.fillRect(X+4,Y,1,1);
+    ctx.fillRect(X,Y-4,1,1);
   }
 }
 
@@ -1442,7 +1522,7 @@ function renderMinimap(){
   ctx.drawImage(mmcv,ox,oy,mw,mh);
   // entities (only on revealed tiles)
   const px=Math.round((p.x/TILE)*s), py=Math.round((p.y/TILE)*s);
-  for(const m of monsters){ const mt=Math.floor(m.y/TILE)*MAP_W+Math.floor(m.x/TILE); if(revealed[mt]){ ctx.fillStyle=rgb(C.red); ctx.fillRect(ox+Math.round((m.x/TILE)*s)-1, oy+Math.round((m.y/TILE)*s)-1, 2,2); } }
+  for(const m of monsters){ if(m.dying>0) continue; const mt=Math.floor(m.y/TILE)*MAP_W+Math.floor(m.x/TILE); if(revealed[mt]){ ctx.fillStyle=rgb(C.red); ctx.fillRect(ox+Math.round((m.x/TILE)*s)-1, oy+Math.round((m.y/TILE)*s)-1, 2,2); } }
   for(const it of items){ const it2=Math.floor(it.y/TILE)*MAP_W+Math.floor(it.x/TILE); if(revealed[it2]){ ctx.fillStyle=rgb(C.yellow); ctx.fillRect(ox+Math.round((it.x/TILE)*s), oy+Math.round((it.y/TILE)*s), 1,1); } }
   // player (white, with outline)
   ctx.fillStyle=rgb(C.black); ctx.fillRect(ox+px-2,oy+py-2,5,5);
@@ -1457,6 +1537,9 @@ function renderPlay(){
   ctx.fillStyle=rgb(C.yellow);
   for(const pr of projectiles) ctx.fillRect(Math.round(pr.x-cx)-1, Math.round(pr.y-cy)-1,3,3);
   for(const m of monsters) drawMonster(m, m.x-cx, m.y-cy, p.x<m.x?'left':'right');
+  for(const q of poofs){ ctx.globalAlpha=Math.max(0,Math.min(1,q.t*4)); ctx.fillStyle=rgb(q.col);
+    ctx.fillRect(Math.round(q.x-cx)-1, Math.round(q.y-cy)-1, 2, 2); }
+  ctx.globalAlpha=1;
   drawHero(p.x-cx, p.y-cy);
   for(const dn of dmgNums){
     const a=Math.max(0,Math.min(1, dn.life/0.45));
